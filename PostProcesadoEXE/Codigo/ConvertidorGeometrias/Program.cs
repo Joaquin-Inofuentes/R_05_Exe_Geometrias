@@ -140,7 +140,7 @@ namespace ConvertidorGeometrias
         }
 
         private const string APP_GUID = "Global\\RevitGeometriaWatcher_JPG_2024";
-        private static string CARPETA_TEMP = @"C:\ProgramData\Autodesk\Revit\Addins\2021\MIP\Temp";
+        private static string CARPETA_TEMP = System.IO.Path.Combine(System.IO.Path.Combine(System.Environment.GetFolderPath(System.Environment.SpecialFolder.LocalApplicationData), "MIP"), "Temp");
         private static string RUTA_BASE_SALIDA = @"C:\NO ENTRAR\JPG\DATA";
         private static string RUTA_LOG = "";
 

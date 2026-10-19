@@ -14,3 +14,6 @@ scratch_*.js
 /_Documentos generados
 _Documentos generados/
 _Documentos generados
+
+# Pruebas internas: copias de .rvt de ARQ (pesadas, no van al repo)
+PruebasInternas/

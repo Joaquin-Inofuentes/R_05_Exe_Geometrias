@@ -32,7 +32,13 @@
     si ProgramData está bloqueado o el exe está en uso por un Revit abierto) no debe tumbar la
     compilación: el .exe ya se generó en el target Build anterior a este.
   -->
-  <Target Name="InstallToMIP" AfterTargets="Build">
+  <!--
+    2026-09-29: APAGADO por defecto (solo corre con /p:InstalarEnMIPLocal=true). Cada build recreaba
+    ProgramData\...\MIP\Executables\Geometria y sembraba un config.json VIEJO (con rutas absolutas de otra
+    instalacion) en %LOCALAPPDATA%\MIP, justo lo que rompio los exes el 2026-09-25. Los exes ahora los pone
+    UNICAMENTE MIP_Revit_Setup.exe en %LOCALAPPDATA%\MIP\Executables, y el config.json lo crea el addin.
+  -->
+  <Target Name="InstallToMIP" AfterTargets="Build" Condition="'$(InstalarEnMIPLocal)'=='true'">
     <PropertyGroup>
       <!--
         BINARIOS: ProgramData, la carpeta de add-ins de TODOS LOS USUARIOS, que es donde instala
