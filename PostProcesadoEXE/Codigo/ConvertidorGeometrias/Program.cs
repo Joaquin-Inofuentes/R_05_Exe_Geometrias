@@ -47,6 +47,15 @@ namespace ConvertidorGeometrias
         // en silencio y el visor muestra la ficha vacía sin ningún error.
         public string FamilyName = "";
         public string TypeName = "";
+        // Formato .bin v8+: nivel y área (m²) / longitud (m) / volumen (m³) leídos por el addin de
+        // PARÁMETROS de Revit. NaN = el elemento no los expone. Mismo CUIDADO que arriba: copiarlos
+        // en cada clonado (CopiarPropiedadesDe) o el visor muestra "—" sin ningún error.
+        public string Level = "";
+        public float Area = float.NaN, Length = float.NaN, Volume = float.NaN;
+        public void CopiarPropiedadesDe(MeshData o)
+        {
+            Level = o.Level; Area = o.Area; Length = o.Length; Volume = o.Volume;
+        }
         public List<Vector3> Vertices = new List<Vector3>();
         public List<Vector3> Normals = new List<Vector3>();
         public List<int> Indices = new List<int>();
@@ -60,6 +69,7 @@ namespace ConvertidorGeometrias
     public class PipelineStats
     {
         public int FormatVersion = 1;
+        public string ArchivoRvt = "";   // .bin v8+: nombre del .rvt de origen
         public string UnidadOrigen = "";
         public Vector3 PuntoBase;
         public int Rooms;          // habitaciones con centroide válido en el JSON
@@ -672,6 +682,7 @@ namespace ConvertidorGeometrias
                 Vertices = new List<Vector3>(src.Vertices),
                 Indices = new List<int>(src.Indices)
             };
+            clon.CopiarPropiedadesDe(src);
             ComputeNormals(clon);
             return clon;
         }
@@ -716,6 +727,7 @@ namespace ConvertidorGeometrias
                     RoomDepartment = first.RoomDepartment,
                     RoomName = first.RoomName
                 };
+                mergedMesh.CopiarPropiedadesDe(first); // v8: nivel, área, longitud, volumen
 
                 int vertexOffset = 0;
                 foreach (var mesh in group)
@@ -883,6 +895,7 @@ namespace ConvertidorGeometrias
                 // (puertas, ventanas, mobiliario) sale al .tbv con familia/tipo -1.
                 FamilyName = source.FamilyName, TypeName = source.TypeName
             };
+            outMesh.CopiarPropiedadesDe(source);
 
             foreach (var v in decimatedMdMesh.Vertices)
             {
@@ -1076,7 +1089,7 @@ namespace ConvertidorGeometrias
             using (var fs = File.OpenRead(path))
             using (var reader = new BinaryReader(fs))
             {
-                bool v2 = false, v3 = false, v4 = false, v5 = false, v6 = false, v7 = false;
+                bool v2 = false, v3 = false, v4 = false, v5 = false, v6 = false, v7 = false, v8 = false;
                 if (fs.Length >= 8)
                 {
                     int magic = reader.ReadInt32();
@@ -1089,6 +1102,7 @@ namespace ConvertidorGeometrias
                         v5 = version >= 5;
                         v6 = version >= 6;
                         v7 = version >= 7;
+                        v8 = version >= 8;
                         stats.FormatVersion = version;
                     }
                     else
@@ -1112,6 +1126,9 @@ namespace ConvertidorGeometrias
                 }
                 stats.PuntoBase = new Vector3(baseX, baseY, baseZ);
 
+                // v8: nombre del archivo .rvt de origen, justo después del Punto Base.
+                if (v8) stats.ArchivoRvt = reader.ReadString() ?? "";
+
                 while (fs.Position < fs.Length)
                 {
                     var mesh = new MeshData();
@@ -1130,6 +1147,15 @@ namespace ConvertidorGeometrias
                     {
                         mesh.FamilyName = reader.ReadString() ?? "";
                         mesh.TypeName = reader.ReadString() ?? "";
+                    }
+
+                    // v8: nivel + área/longitud/volumen (de parámetros de Revit), después del tipo.
+                    if (v8)
+                    {
+                        mesh.Level = reader.ReadString() ?? "";
+                        mesh.Area = reader.ReadSingle();
+                        mesh.Length = reader.ReadSingle();
+                        mesh.Volume = reader.ReadSingle();
                     }
 
                     if (v2)
@@ -1505,15 +1531,21 @@ namespace ConvertidorGeometrias
         //           int32 vertexCount, uint8 idx16(1/0), int32 triCount,
         //           float32 positions[vc*3], int8 normals[vc*3],
         //           (idx16? uint16 : uint32) indices[triCount*3]
+        // v5 (2026-10): propiedades por elemento leídas de PARÁMETROS de Revit. Tras la tabla de
+        // nombres va int32 fileIdx (nombre del .rvt de origen, -1 = sin dato) y cada instancia
+        // agrega, después de typeIdx: int32 levelIdx (nombre del nivel en la tabla de nombres),
+        // float32 area (m²), float32 length (m, largo/longitud/perímetro), float32 volume (m³).
+        // NaN = el elemento no expone ese parámetro.
         //   Instancias × instCount:
         //           int32 meshIndex, int32 elementId, int32 categoryId, int32 materialIndex,
         //           (v4+) int32 familyIdx, int32 typeIdx,   // índice en la tabla de nombres, -1 = sin dato
+        //           (v5+) int32 levelIdx, float32 area, float32 length, float32 volume,
         //           float32 tx,ty,tz, float32 gmin[3], float32 gmax[3],
         //           uint16 guidLen, byte[guidLen] guid(UTF8)
         static void ExportToViewerBin(List<MeshData> meshes, string path, PipelineStats stats)
         {
             const int MAGIC = 0x56544254; // "TBTV"
-            const int VERSION = 4;
+            const int VERSION = 5;
             // Tope del prefijo de longitud (uint16) de cada nombre de la tabla.
             const int NAME_MAX_BYTES = 65535;
             const float UNITS_PER_METER_OUT = 1.0f; // el pipeline siempre entrega metros de acá en más
@@ -1621,11 +1653,14 @@ namespace ConvertidorGeometrias
 
             var instFamIdx = new List<int>(instSource.Count);
             var instTypIdx = new List<int>(instSource.Count);
+            var instLvlIdx = new List<int>(instSource.Count);
             foreach (var m in instSource)
             {
                 instFamIdx.Add(indiceNombre(m.FamilyName));
                 instTypIdx.Add(indiceNombre(m.TypeName));
+                instLvlIdx.Add(indiceNombre(m.Level));
             }
+            int archivoIdx = indiceNombre(stats.ArchivoRvt);
 
             // AABB de toda la escena (para encuadre inicial del visor)
             Vector3 sMin = new Vector3(float.MaxValue), sMax = new Vector3(float.MinValue);
@@ -1686,6 +1721,7 @@ namespace ConvertidorGeometrias
                     w.Write((ushort)nb.Length);
                     w.Write(nb);
                 }
+                w.Write(archivoIdx); // v5: nombre del .rvt de origen (índice en la tabla, -1 = sin dato)
 
                 // Meshes del pool
                 foreach (var pm in pool)
@@ -1729,6 +1765,10 @@ namespace ConvertidorGeometrias
                     w.Write(matIndexById[m.MaterialId]);
                     w.Write(instFamIdx[i]); // v4: índice en la tabla de nombres, -1 = sin dato
                     w.Write(instTypIdx[i]); // v4: idem
+                    w.Write(instLvlIdx[i]); // v5: nivel (índice en la tabla de nombres)
+                    w.Write(m.Area);        // v5: m² (NaN = sin parámetro)
+                    w.Write(m.Length);      // v5: m
+                    w.Write(m.Volume);      // v5: m³
                     w.Write(d.X); w.Write(d.Y); w.Write(d.Z);
                     w.Write(gmin.X); w.Write(gmin.Y); w.Write(gmin.Z);
                     w.Write(gmax.X); w.Write(gmax.Y); w.Write(gmax.Z);
