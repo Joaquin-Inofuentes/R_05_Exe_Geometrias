@@ -167,6 +167,8 @@ namespace ConvertidorGeometrias
                 // este watcher jamás miraba: los .tbv y los JSON de habitaciones no aparecían nunca y no
                 // había ningún error visible en ningún lado.
                 CARPETA_TEMP = Path.Combine(args[0], "Temp");
+                _basePluginFolder = args[0];   // T07: ProgresoLotes lee tomados_*.txt de aca
+                _sufijoMutex = SufijoMutexInstalacion(args[0]);   // T14: build lado a lado
                 RUTA_LOG = Path.Combine(args[0], "Logs", $"Log_Geometria_{DateTime.Now:yyyy-MM-dd}.txt");
             }
             else
@@ -183,7 +185,7 @@ namespace ConvertidorGeometrias
             Log("=== POST-PROCESO DE GEOMETRIAS - INICIANDO ===");
 
             bool createdNew;
-            using (Mutex mutex = new Mutex(true, APP_GUID, out createdNew))
+            using (Mutex mutex = new Mutex(true, APP_GUID + _sufijoMutex, out createdNew))
             {
                 if (!createdNew)
                 {
@@ -241,6 +243,41 @@ namespace ConvertidorGeometrias
             }
         }
 
+        // T14 (build lado a lado MIP_UNBOX): si la carpeta personal que pasa el addin (args[0]) NO es %LOCALAPPDATA%\MIP, es una
+        // instalacion de prueba y el mutex lleva un sufijo propio, asi este exe no pelea la instancia unica con el watcher productivo
+        // (su cola Temp ya sale de args[0]). En produccion (args[0] == %LOCALAPPDATA%\MIP) el sufijo es "" y el nombre no cambia.
+        // Misma formula que CarpetaPersonalMip.SufijoMutex (R_01).
+        private static string _sufijoMutex = "";
+        private static string SufijoMutexInstalacion(string basePluginFolder)
+        {
+            try
+            {
+                string real = Path.GetFullPath(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "MIP")).TrimEnd('\\');
+                string p = Path.GetFullPath(basePluginFolder).TrimEnd('\\');
+                if (string.Equals(p, real, StringComparison.OrdinalIgnoreCase)) return "";
+                using (var sha = System.Security.Cryptography.SHA256.Create())
+                {
+                    byte[] h = sha.ComputeHash(Encoding.UTF8.GetBytes(p.ToLowerInvariant()));
+                    return "_" + h[0].ToString("x2") + h[1].ToString("x2") + h[2].ToString("x2") + h[3].ToString("x2");
+                }
+            }
+            catch { return ""; }
+        }
+
+        // T07: avance del lote "[N/M] hechos H ..." (ProgresoLotes.cs, copia de R_01/tools/_compartido). Solo informativo:
+        // cualquier falla => "" y el exe sigue exactamente igual.
+        private static string _basePluginFolder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "MIP");
+        private static string LineaProgreso(string nombreProyecto)
+        {
+            try
+            {
+                int bins = -1;
+                try { bins = Directory.GetFiles(CARPETA_TEMP, "*.bin").Length; } catch { }
+                return UnboxCompartido.ProgresoLotes.LineaPara(_basePluginFolder, nombreProyecto, bins);
+            }
+            catch { return ""; }
+        }
+
         private static bool EstaBloqueado(string path)
         {
             try
@@ -257,6 +294,7 @@ namespace ConvertidorGeometrias
                 Path.GetFileNameWithoutExtension(filePath), out intentoIgnorado0).Replace("_Geometria", "");
 
             Log($"===== Procesando: {Path.GetFileName(filePath)} =====");
+            Consola.Detalle(LineaProgreso(nombreProyecto));   // T07: [N/M] del lote
             Consola.FilaInicio(nombreProyecto, "leyendo dump");
 
             try
@@ -320,6 +358,7 @@ namespace ConvertidorGeometrias
                 File.WriteAllText(reportPath, reporte);
                 Log($"Reporte guardado en: {reportPath}");
 
+                Consola.Detalle(LineaProgreso(nombreProyecto));   // T07
                 Consola.FilaFin(nombreProyecto, swFile.Elapsed, true,
                     $"{stats.OutputPieces} piezas" + (rotasFinales.Count > 0 ? $", {rotasFinales.Count} rota(s)" : ""));
 
@@ -328,6 +367,7 @@ namespace ConvertidorGeometrias
             catch (Exception ex)
             {
                 Log(" !!! FALLA: " + ex.Message + "\n" + ex.StackTrace);
+                Consola.Detalle(LineaProgreso(nombreProyecto));   // T07
                 Consola.FilaFin(nombreProyecto, TimeSpan.Zero, false, ex.Message);
 
                 // El .bin es irreproducible sin volver a exportar desde Revit: en vez de
@@ -1823,6 +1863,10 @@ namespace ConvertidorGeometrias
         private static int _esperandoIndex = 0;
         private static char[] _spinner = new[] { '\\', '|', '/', '-' };
         private static bool _enEsperando = false;
+        // T07: avance "[N/M] ..." del lote (ProgresoLotes); se agrega como DETALLE al final del renglon.
+        private static string _detalle = "";
+        private static int _ultLargoFila = 0;
+        public static void Detalle(string d) { lock (_candado) { _detalle = d ?? ""; } }
 
         /// <summary>Hora en que arranco el proyecto en curso; la usa el log para su columna HoraInicio.</summary>
         public static DateTime InicioActual { get { return _inicio; } }
@@ -1960,7 +2004,7 @@ namespace ConvertidorGeometrias
             }
 
             // Limpiamos linea
-            Console.Write("\r" + new string(' ', 100) + "\r");
+            Console.Write("\r" + new string(' ', Math.Max(100, _ultLargoFila)) + "\r");
             
             if (ok) Console.ForegroundColor = ConsoleColor.Gray;
             else Console.ForegroundColor = ConsoleColor.Red;
@@ -1969,6 +2013,8 @@ namespace ConvertidorGeometrias
             
             string res = $"{sDelta}\t{sIni}\t{sFin}\t{_nombre}\t{barraAvance}\t{_etapa}\t{dur}";
             if (!string.IsNullOrEmpty(cola)) res += "\t" + cola;
+            if (!string.IsNullOrEmpty(_detalle)) res += (string.IsNullOrEmpty(cola) ? "\t" : "  ") + _detalle;
+            _ultLargoFila = res.Length + 40;
             
             Console.Write(res);
             Console.ResetColor();
