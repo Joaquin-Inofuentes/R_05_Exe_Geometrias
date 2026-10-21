@@ -2004,7 +2004,7 @@ namespace ConvertidorGeometrias
             }
 
             // Limpiamos linea
-            Console.Write("\r" + new string(' ', Math.Max(100, _ultLargoFila)) + "\r");
+            Console.Write("\r" + new string(' ', AnchoUtilFila()) + "\r");
             
             if (ok) Console.ForegroundColor = ConsoleColor.Gray;
             else Console.ForegroundColor = ConsoleColor.Red;
@@ -2016,10 +2016,32 @@ namespace ConvertidorGeometrias
             if (!string.IsNullOrEmpty(_detalle)) res += (string.IsNullOrEmpty(cola) ? "\t" : "  ") + _detalle;
             _ultLargoFila = res.Length + 40;
             
-            Console.Write(res);
+            Console.Write(AjustarFila(res));
             Console.ResetColor();
         }
 
+        // La fila se repinta con '\r'. Si es mas ancha que la ventana se parte en dos renglones y cada
+        // repintado queda apilado debajo del anterior: se expanden los tabuladores (paradas de 8) y se
+        // recorta a ancho-1 para que ocupe SIEMPRE un solo renglon.
+        private static int AnchoUtilFila()
+        {
+            try { int w = Console.WindowWidth; return w > 20 ? w - 1 : 119; }
+            catch { return 119; }
+        }
+
+        private static string AjustarFila(string fila)
+        {
+            int max = AnchoUtilFila();
+            var sb = new System.Text.StringBuilder(max);
+            foreach (char c in fila ?? "")
+            {
+                if (sb.Length >= max) break;
+                if (c == '\t') { int n = 8 - (sb.Length % 8); sb.Append(' ', Math.Min(n, max - sb.Length)); }
+                else if (c == '\r' || c == '\n') sb.Append(' ');
+                else sb.Append(c);
+            }
+            return sb.ToString();
+        }
         public static string Duracion(TimeSpan t)
         {
             if (t.TotalSeconds < 60) return t.TotalSeconds.ToString("F1") + "s";
