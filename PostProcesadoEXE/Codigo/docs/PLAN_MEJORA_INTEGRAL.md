@@ -1,8 +1,8 @@
 # Plan de Mejora Integral — Pipeline Revit → WebGL para Móviles de Gama Baja
 
-**Objetivo:** que el modelo completo del edificio cargue y se mueva **ultra fluido (30+ FPS estables) en un móvil de gama baja**, ya sea servido desde Vercel, como `index.html` simple, o embebido en Unity WebGL. El visor debe recibir **la ruta del archivo de modelo (.tbv) y cargarlo solo** (con caché), manteniendo el ejemplo incrustado actual solo como modo de prueba.
+**Objetivo:** que el modelo completo del edificio cargue y se mueva **ultra fluido (30+ FPS estables) en un móvil de gama baja**, ya sea servido desde el hosting anterior, como `index.html` simple, o embebido en Unity WebGL. El visor debe recibir **la ruta del archivo de modelo (.tbv) y cargarlo solo** (con caché), manteniendo el ejemplo incrustado actual solo como modo de prueba.
 
-**Alcance:** punta a punta — Macro de Revit (IN) → `export.bin` → `ConvertidorGeometrias.exe` → formato `.tbv` → visor web (OUT) → despliegue (Vercel / Unity WebGL).
+**Alcance:** punta a punta — Macro de Revit (IN) → `export.bin` → `ConvertidorGeometrias.exe` → formato `.tbv` → visor web (OUT) → despliegue (el hosting anterior / Unity WebGL).
 
 ---
 
@@ -45,7 +45,7 @@ Datos del modelo de ejemplo (`export_reporte.txt` + archivos reales):
 - Índices `uint32` cuando la malla supera 65k vértices — evitable con chunking.
 - GUID completo (45 bytes + 2 de largo) por instancia: los 37 primeros caracteres del `UniqueId` de Revit son **el mismo GUID de documento repetido 2.635 veces** (~110 KB desperdiciados).
 - Sin tabla de offsets → imposible streaming o carga progresiva.
-- Sin compresión (Vercel puede servir Brotli, pero el Base64 embebido lo anula).
+- Sin compresión (el hosting anterior puede servir Brotli, pero el Base64 embebido lo anula).
 
 **OUT — Visor ([index.html](index.html)):**
 - `MeshBasicMaterial` **ignora las normales** que el `.tbv` paga en bytes y parseo (246 KB muertos), y el modelo se ve plano, sin profundidad.
@@ -158,7 +158,7 @@ Cambios de layout (mantener lector v1 en el visor durante la transición):
 
 ### Compresión y entrega
 - Generar también **`export.tbv.br`** (Brotli nivel 10) en el EXE. La cuantización mejora muchísimo la compresibilidad (los `uint16` deltificados comprimen 3–4×).
-- Cliente: `fetch` + `DecompressionStream('gzip'/'br' según soporte)`; fallback a `.tbv` sin comprimir. En Vercel, servir con `Content-Encoding` correcto y `Cache-Control: public, max-age=31536000, immutable` (el nombre del archivo lleva hash: `export.a1b2c3.tbv.br`).
+- Cliente: `fetch` + `DecompressionStream('gzip'/'br' según soporte)`; fallback a `.tbv` sin comprimir. En el hosting anterior, servir con `Content-Encoding` correcto y `Cache-Control: public, max-age=31536000, immutable` (el nombre del archivo lleva hash: `export.a1b2c3.tbv.br`).
 
 **Estimación de peso para este modelo** (post F1.1 + F3): geometría del pool reducida por instancing real + cuantización + Brotli ≈ **400–700 KB** de descarga (vs 3.066 KB actuales embebidos). 
 
@@ -170,7 +170,7 @@ Cambios de layout (mantener lector v1 en el visor durante la transición):
 
 ### F7.1 Carga de modelos por ruta (el flujo que pediste)
 ```
-index.html?model=https://tu-cdn.vercel.app/modelos/edificioA.tbv.br
+index.html?model=(URL anterior)
 ```
 1. El visor lee `?model=` (o recibe la URL por `postMessage` desde Unity/MIP).
 2. Busca en **IndexedDB** por clave `url + versión` → si está, carga local (0 red, arranque < 1 s).
@@ -209,14 +209,14 @@ index.html?model=https://tu-cdn.vercel.app/modelos/edificioA.tbv.br
 
 ---
 
-## 8. FASE 5 — Despliegue: Vercel + Unity WebGL
+## 8. FASE 5 — Despliegue: el hosting anterior + Unity WebGL
 
-### Vercel (estático)
+### el hosting anterior (estático)
 ```
 /               index.html   (~25 KB, sin modelo)
 /vendor/        three.module.min.js (local, pinned)
 /modelos/       edificioA.f3a9.tbv.br  (immutable, hash en nombre)
-vercel.json     headers: Content-Encoding br para *.tbv.br, immutable cache
+rutas.json     headers: Content-Encoding br para *.tbv.br, immutable cache
 ```
 - `index.html` con `max-age` corto; modelos con hash + `immutable` → segundo arranque casi instantáneo incluso sin IndexedDB.
 - (Opcional) Service Worker cache-first para modo offline total, reutilizando los patrones de `sw.js`/`mapa.json` de MIP.
@@ -247,7 +247,7 @@ vercel.json     headers: Content-Encoding br para *.tbv.br, immutable cache
 | 4 | **F2** Chunking + LODs + paralelo | 3–4 | F1 | ≤ 60 draw calls |
 | 5 | **F3** TBV2 cuantizado + Brotli | 2–3 | F2 | Descarga ≤ 700 KB |
 | 6 | **F4 resto** (worker, streaming, IndexedDB, `?model=`, picking AABB, catálogo de errores) | 3–4 | F3 | Flujo final "le paso la ruta y carga" |
-| 7 | **F5** Vercel + integración Unity | 1–2 | F4 | Producción |
+| 7 | **F5** el hosting anterior + integración Unity | 1–2 | F4 | Producción |
 | 8 | **F6** QA en dispositivo real + docs | continuo | todas | Presupuestos verificados |
 
 **Total estimado: ~3 semanas** de trabajo neto. Los pasos 1–2 (día y medio) ya deberían llevar el visor actual de "roto/<15 FPS" a "funcional y fluido con el modelo de prueba embebido de hoy", que es exactamente lo que necesitás para seguir probando mientras se hace el resto.
