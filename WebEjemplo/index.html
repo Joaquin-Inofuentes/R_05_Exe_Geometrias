@@ -3288,7 +3288,7 @@
         async toggle() {
             if (this.active) return this.disable();
             if (!window.isSecureContext) {
-                reportError('CÁMARA', 'La cámara necesita HTTPS. Abrí la app por https:// (Vercel) o localhost.');
+                reportError('CÁMARA', 'La cámara necesita HTTPS. Abrí la app por https://babelbim.com o localhost.');
                 return;
             }
             if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
@@ -3379,7 +3379,7 @@
             // El sensor de orientación sólo funciona en contexto seguro
             // (HTTPS o localhost). En http plano iOS/Android lo bloquean.
             if (!window.isSecureContext) {
-                reportError('GIROSCOPIO', 'Necesita HTTPS. Abrí la app por https:// (Vercel ya lo es) o localhost.');
+                reportError('GIROSCOPIO', 'Necesita HTTPS. Abrí la app por https://babelbim.com (ya es HTTPS) o localhost.');
                 return;
             }
             if (typeof DeviceOrientationEvent === 'undefined') {
