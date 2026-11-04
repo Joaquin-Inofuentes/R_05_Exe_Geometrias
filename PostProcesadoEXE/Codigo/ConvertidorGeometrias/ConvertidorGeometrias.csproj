@@ -15,6 +15,11 @@
     <PackageReference Include="Costura.Fody" Version="5.7.0" PrivateAssets="all" />
   </ItemGroup>
 
+  <!-- Imagenes de personas/arbustos que el conversor incrusta como bloque 'TXR1' en cada .tbv (ver EscribirBloqueSprites). -->
+  <ItemGroup>
+    <None Include="sprites_fuente\*.png" Link="sprites\%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
   <Target Name="CleanUpOutputs" AfterTargets="Build">
     <ItemGroup>
       <FilesToDelete Include="$(OutputPath)*.dll" />

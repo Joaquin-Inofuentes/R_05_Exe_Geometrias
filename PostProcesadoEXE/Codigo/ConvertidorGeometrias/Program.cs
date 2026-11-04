@@ -1817,9 +1817,63 @@ namespace ConvertidorGeometrias
                     w.Write((ushort)gb.Length);
                     w.Write(gb);
                 }
+
+                EscribirBloqueSprites(w);
             }
 
             stats.TbvBytes = new FileInfo(path).Length;
+        }
+
+        // Bloque OPCIONAL 'TXR1' al final del .tbv: una imagen (PNG con transparencia) por familia de Revit cuyo cuerpo exportado es
+        // un reemplazo gris (personas RPC, macetas VE_Planta). El visor dibuja el sprite en lugar de esa malla. No cambia la version
+        // del .tbv; un visor viejo ignora el bloque (el parser anterior lo rechazaria, por eso el visor se despliega primero).
+        // Fuente: carpeta "sprites" junto al exe, con archivos "<FamilyName>.<cartel|cruz>.png" (p.ej. "RPC Hombre.cartel.png",
+        // "VE_Planta.cruz.png"). Sin carpeta o sin archivos no se escribe nada. Formato: Visor3D/core/TbvSprites.js.
+        static void EscribirBloqueSprites(BinaryWriter w)
+        {
+            try
+            {
+                string dir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "sprites");
+                if (!Directory.Exists(dir)) return;
+                var defs = new List<(string clave, byte modo, byte[] png)>();
+                foreach (var f in Directory.GetFiles(dir, "*.png").OrderBy(x => x, StringComparer.OrdinalIgnoreCase))
+                {
+                    string n = Path.GetFileNameWithoutExtension(f);          // "RPC Hombre.cartel"
+                    int punto = n.LastIndexOf('.');
+                    if (punto <= 0) continue;
+                    string modoTxt = n.Substring(punto + 1).ToLowerInvariant();
+                    if (modoTxt != "cartel" && modoTxt != "cruz") continue;
+                    byte[] png = File.ReadAllBytes(f);
+                    if (png.Length == 0 || png.Length > 4 * 1024 * 1024) continue;
+                    defs.Add((n.Substring(0, punto), (byte)(modoTxt == "cruz" ? 1 : 0), png));
+                    if (defs.Count >= 64) break;
+                }
+                if (defs.Count == 0) return;
+                byte[] bloque;
+                using (var ms = new MemoryStream())
+                using (var bw = new BinaryWriter(ms))
+                {
+                    bw.Write(0x31525854); // 'TXR1'
+                    bw.Write(defs.Count);
+                    foreach (var d in defs)
+                    {
+                        var kb = Encoding.UTF8.GetBytes(d.clave);
+                        bw.Write((ushort)kb.Length);
+                        bw.Write(kb);
+                        bw.Write(d.modo);
+                        bw.Write(d.png.Length);
+                        bw.Write(d.png);
+                    }
+                    bw.Flush();
+                    bloque = ms.ToArray();
+                }
+                w.Write(bloque);   // de una vez: o entra entero o no entra
+            }
+            catch (Exception ex)
+            {
+                // Los sprites son un adorno: si fallan, el .tbv sigue siendo valido sin el bloque (no se escribio nada).
+                Console.WriteLine("[sprites] no se pudo escribir el bloque: " + ex.Message);
+            }
         }
 
         static sbyte Snorm(float f)
