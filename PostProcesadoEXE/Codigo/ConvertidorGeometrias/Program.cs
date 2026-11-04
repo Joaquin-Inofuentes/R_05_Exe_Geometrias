@@ -1818,7 +1818,7 @@ namespace ConvertidorGeometrias
                     w.Write(gb);
                 }
 
-                EscribirBloqueSprites(w);
+                EscribirBloqueSprites(w, nameIndex);
             }
 
             stats.TbvBytes = new FileInfo(path).Length;
@@ -1829,7 +1829,7 @@ namespace ConvertidorGeometrias
         // del .tbv; un visor viejo ignora el bloque (el parser anterior lo rechazaria, por eso el visor se despliega primero).
         // Fuente: carpeta "sprites" junto al exe, con archivos "<FamilyName>.<cartel|cruz>.png" (p.ej. "RPC Hombre.cartel.png",
         // "VE_Planta.cruz.png"). Sin carpeta o sin archivos no se escribe nada. Formato: Visor3D/core/TbvSprites.js.
-        static void EscribirBloqueSprites(BinaryWriter w)
+        static void EscribirBloqueSprites(BinaryWriter w, Dictionary<string, int> nombres)
         {
             try
             {
@@ -1841,6 +1841,9 @@ namespace ConvertidorGeometrias
                     string n = Path.GetFileNameWithoutExtension(f);          // "RPC Hombre.cartel"
                     int punto = n.LastIndexOf('.');
                     if (punto <= 0) continue;
+                    // Sólo viaja la imagen de una familia que este .tbv realmente trae (no se agregan 300 KB a un modelo sin personas ni arbustos).
+                    int ixNombre;
+                    if (!nombres.TryGetValue(n.Substring(0, punto), out ixNombre) || ixNombre < 0) continue;
                     string modoTxt = n.Substring(punto + 1).ToLowerInvariant();
                     if (modoTxt != "cartel" && modoTxt != "cruz") continue;
                     byte[] png = File.ReadAllBytes(f);
