@@ -60,6 +60,11 @@ namespace ConvertidorGeometrias
         public List<Vector3> Normals = new List<Vector3>();
         public List<int> Indices = new List<int>();
 
+        // Dedup afín (v6): esta pieza es la malla final de DedupRef transformada por DedupM (3x3 fila a fila + traslación, 12 doubles).
+        // Sólo es una pista: ExportToViewerBin la vuelve a verificar contra los vértices reales antes de usarla.
+        public MeshData DedupRef;
+        public double[] DedupM;
+
         // v4: Metadata de habitaciones (solo si CategoryId == -2000160 / OST_Rooms)
         public string RoomLevel = "";
         public string RoomDepartment = "";
@@ -88,6 +93,8 @@ namespace ConvertidorGeometrias
         public int Instanced;      // piezas que reusan la malla de otra idéntica (GLB más chico)
         public int Repaired;       // piezas rotas reparadas restaurando su geometría original
         public int PoolMeshes;     // geometrías únicas en el .tbv tras deduplicar
+        public int AfinDedup;      // piezas que reusan la malla (ya decimada) de otra idéntica salvo rotación/escala/espejo
+        public int AfinEnPool;     // de esas, las que el .tbv guardó como instancia con matriz
         public long TbvBytes;      // tamaño del binario de visor
         public int HatchedMats;    // materiales con patrón de superficie (hatch) en el .tbv
     }
@@ -525,6 +532,7 @@ namespace ConvertidorGeometrias
             sb.AppendLine($"Materiales transparentes (vidrio): {s.Transparent}");
             sb.AppendLine($"Piezas instanciadas (malla compartida): {s.Instanced}");
             sb.AppendLine($"Geometrías únicas en el .tbv (dedup): {s.PoolMeshes} de {s.OutputPieces} piezas");
+            sb.AppendLine($"Piezas reusadas con rotación/escala (dedup afín, sin decimar de nuevo): {s.AfinDedup}; guardadas como matriz en el .tbv: {s.AfinEnPool}");
             sb.AppendLine($"Materiales con patrón de superficie (hatch de muros): {s.HatchedMats}" +
                           (s.HatchedMats == 0 && s.FormatVersion >= 6
                               ? " -- ningún material de muro tenía un patrón de MODELO utilizable"
@@ -743,6 +751,7 @@ namespace ConvertidorGeometrias
             // pieza por material, cada una con su color y su protección de vidrio correctas.
             var grouped = inputMeshes.GroupBy(m => m.PieceKey);
             var optimizedList = new List<MeshData>();
+            var afinReps = new Dictionary<(int, int, int, int, long), List<RepAfin>>();
 
             foreach (var group in grouped)
             {
@@ -803,6 +812,22 @@ namespace ConvertidorGeometrias
                 {
                     stats.Discarded++;
                     continue;
+                }
+
+                // Dedup afín ANTES de decimar: si esta pieza es otra ya procesada rotada / espejada / estirada (mismos vértices
+                // en el mismo orden y mismos índices, a una transformación afín), no se decima de nuevo: reusa la malla final
+                // de aquélla transformada. Es lo que permite al .tbv guardarla UNA vez (decimada igual para todas las copias).
+                if (mergedMesh.CategoryId != CatRooms)
+                {
+                    var afin = IntentarDedupAfin(mergedMesh, afinReps);
+                    if (afin != null)
+                    {
+                        stats.AfinDedup++;
+                        stats.VertsOut += afin.Vertices.Count;
+                        stats.TrisOut += afin.Indices.Count / 3;
+                        optimizedList.Add(afin);
+                        continue;
+                    }
                 }
 
                 int originalTriangles = mergedMesh.Indices.Count / 3;
@@ -868,11 +893,151 @@ namespace ConvertidorGeometrias
                 stats.VertsOut += outMesh.Vertices.Count;
                 stats.TrisOut += outMesh.Indices.Count / 3;
                 optimizedList.Add(outMesh);
+                if (mergedMesh.CategoryId != CatRooms) RegistrarRepAfin(mergedMesh, outMesh, afinReps);
             }
 
             stats.OutputPieces = optimizedList.Count;
             return optimizedList;
         }
+
+        // ================== DEDUP AFÍN ==================
+        // Una malla B es "copia afín" de A si tiene los mismos índices y B.v[i] = M·A.v[i] + t para TODO vértice (M 3x3 cualquiera:
+        // rotación, espejo, escala distinta por eje, hasta cizalla). Cubre codos y accesorios girados, y tramos rectos de tubería del
+        // mismo diámetro y distinto largo. Se resuelve M con 4 vértices bien condicionados de A y se verifica con TODOS los de B.
+        const double EpsAfin = 2e-4;   // 0,2 mm
+
+        class RepAfin
+        {
+            public MeshData Welded;    // la malla soldada original (entrada de la decimación)
+            public MeshData Final;     // lo que salió (decimada o no): es lo que se transforma
+            public int[] B;            // 4 índices de vértice
+            public double[] InvEa;     // inversa (3x3, por filas) de la matriz de aristas de A
+        }
+
+        static long HashIndices(List<int> ix)
+        {
+            unchecked
+            {
+                long h = 1469598103934665603;
+                foreach (var i in ix) h = (h ^ i) * 1099511628211;
+                return h;
+            }
+        }
+
+        static (int, int, int, int, long) ClaveAfin(MeshData m) =>
+            (m.CategoryId, m.MaterialId, m.Vertices.Count, m.Indices.Count, HashIndices(m.Indices));
+
+        static void RegistrarRepAfin(MeshData welded, MeshData final, Dictionary<(int, int, int, int, long), List<RepAfin>> reps)
+        {
+            if (welded.Vertices.Count < 4 || final.Vertices.Count < 4) return;
+            if (!BaseAfin(welded.Vertices, out var idx, out var inv)) return;
+            var key = ClaveAfin(welded);
+            if (!reps.TryGetValue(key, out var lista)) { lista = new List<RepAfin>(); reps[key] = lista; }
+            lista.Add(new RepAfin { Welded = welded, Final = final, B = idx, InvEa = inv });
+        }
+
+        // 4 vértices que forman un tetraedro bien condicionado; false si la malla es plana o degenerada (ahí no hay afín único).
+        static bool BaseAfin(List<Vector3> v, out int[] idx, out double[] inv)
+        {
+            idx = null; inv = null;
+            int n = v.Count;
+            var a = v[0];
+            int i1 = 0; double d1 = -1;
+            for (int i = 1; i < n; i++) { double d = (v[i] - a).LengthSquared(); if (d > d1) { d1 = d; i1 = i; } }
+            if (d1 < 1e-12) return false;
+            var e1 = v[i1] - a;
+            int i2 = 0; double c2 = -1;
+            for (int i = 0; i < n; i++) { double c = Vector3.Cross(e1, v[i] - a).LengthSquared(); if (c > c2) { c2 = c; i2 = i; } }
+            if (c2 < 1e-16) return false;
+            var e2 = v[i2] - a;
+            var nrm = Vector3.Cross(e1, e2);
+            int i3 = 0; double c3 = -1;
+            for (int i = 0; i < n; i++) { double c = Math.Abs(Vector3.Dot(nrm, v[i] - a)); if (c > c3) { c3 = c; i3 = i; } }
+            var e3 = v[i3] - a;
+            if (c3 < 1e-4 * Math.Sqrt(e1.LengthSquared()) * Math.Sqrt(e2.LengthSquared()) * Math.Sqrt(e3.LengthSquared())) return false;
+            // Ea tiene por COLUMNAS e1,e2,e3
+            double[] ea = { e1.X, e2.X, e3.X, e1.Y, e2.Y, e3.Y, e1.Z, e2.Z, e3.Z };
+            inv = Inv3(ea);
+            if (inv == null) return false;
+            idx = new[] { 0, i1, i2, i3 };
+            return true;
+        }
+
+        static double[] Inv3(double[] m)
+        {
+            double a = m[0], b = m[1], c = m[2], d = m[3], e = m[4], f = m[5], g = m[6], h = m[7], i = m[8];
+            double A = e * i - f * h, B = -(d * i - f * g), C = d * h - e * g;
+            double det = a * A + b * B + c * C;
+            if (Math.Abs(det) < 1e-18) return null;
+            return new[] { A / det, -(b * i - c * h) / det, (b * f - c * e) / det,
+                           B / det, (a * i - c * g) / det, -(a * f - c * d) / det,
+                           C / det, -(a * h - b * g) / det, (a * e - b * d) / det };
+        }
+
+        // Devuelve la pieza B como transformación afín de la malla final de un representante, o null si no encaja con ninguno.
+        static MeshData IntentarDedupAfin(MeshData b, Dictionary<(int, int, int, int, long), List<RepAfin>> reps)
+        {
+            if (b.Vertices.Count < 4) return null;
+            if (!reps.TryGetValue(ClaveAfin(b), out var lista)) return null;
+            foreach (var r in lista)
+            {
+                var m = ResolverAfin(r, b);
+                if (m == null) continue;
+                var fv = r.Final.Vertices;
+                var clon = new MeshData
+                {
+                    Guid = b.Guid, ElementId = b.ElementId, MaterialId = b.MaterialId, CategoryId = b.CategoryId,
+                    ColR = b.ColR, ColG = b.ColG, ColB = b.ColB, ColA = b.ColA, HasColor = b.HasColor,
+                    HatchAngle = b.HatchAngle, HatchSpacing = b.HatchSpacing,
+                    FamilyName = b.FamilyName, TypeName = b.TypeName,
+                    RoomLevel = b.RoomLevel, RoomDepartment = b.RoomDepartment, RoomName = b.RoomName,
+                    Vertices = new List<Vector3>(fv.Count), Indices = new List<int>(r.Final.Indices)
+                };
+                clon.CopiarPropiedadesDe(b);
+                foreach (var p in fv) clon.Vertices.Add(AplicarAfin(m, p));
+                ComputeNormals(clon);
+                clon.DedupRef = r.Final;
+                clon.DedupM = m;
+                return clon;
+            }
+            return null;
+        }
+
+        // M (fila a fila, 9) + t (3) tales que b.v[i] = M·rep.v[i] + t para todo i; null si no.
+        static double[] ResolverAfin(RepAfin r, MeshData b)
+        {
+            var av = r.Welded.Vertices; var bv = b.Vertices;
+            if (av.Count != bv.Count) return null;
+            var I = r.B;
+            var a0 = av[I[0]]; var b0 = bv[I[0]];
+            double[] eb = new double[9];
+            for (int k = 1; k <= 3; k++)
+            {
+                var d = bv[I[k]] - b0;
+                eb[k - 1] = d.X; eb[3 + k - 1] = d.Y; eb[6 + k - 1] = d.Z;
+            }
+            var iv = r.InvEa;
+            var M = new double[12];
+            for (int row = 0; row < 3; row++)
+                for (int col = 0; col < 3; col++)
+                    M[3 * row + col] = eb[3 * row] * iv[col] + eb[3 * row + 1] * iv[3 + col] + eb[3 * row + 2] * iv[6 + col];
+            M[9] = b0.X - (M[0] * a0.X + M[1] * a0.Y + M[2] * a0.Z);
+            M[10] = b0.Y - (M[3] * a0.X + M[4] * a0.Y + M[5] * a0.Z);
+            M[11] = b0.Z - (M[6] * a0.X + M[7] * a0.Y + M[8] * a0.Z);
+            for (int i = 0; i < av.Count; i++)
+            {
+                var p = av[i]; var q = bv[i];
+                if (Math.Abs(M[0] * p.X + M[1] * p.Y + M[2] * p.Z + M[9] - q.X) > EpsAfin) return null;
+                if (Math.Abs(M[3] * p.X + M[4] * p.Y + M[5] * p.Z + M[10] - q.Y) > EpsAfin) return null;
+                if (Math.Abs(M[6] * p.X + M[7] * p.Y + M[8] * p.Z + M[11] - q.Z) > EpsAfin) return null;
+            }
+            return M;
+        }
+
+        static Vector3 AplicarAfin(double[] m, Vector3 p) => new Vector3(
+            (float)(m[0] * p.X + m[1] * p.Y + m[2] * p.Z + m[9]),
+            (float)(m[3] * p.X + m[4] * p.Y + m[5] * p.Z + m[10]),
+            (float)(m[6] * p.X + m[7] * p.Y + m[8] * p.Z + m[11]));
 
         // Presupuesto CONSERVADOR: preferimos triángulos de más antes que piezas rotas.
         // Muros/suelos/techos ni siquiera llegan acá (categorías protegidas); esto aplica
@@ -1576,6 +1741,15 @@ namespace ConvertidorGeometrias
         // agrega, después de typeIdx: int32 levelIdx (nombre del nivel en la tabla de nombres),
         // float32 area (m²), float32 length (m, largo/longitud/perímetro), float32 volume (m³).
         // NaN = el elemento no expone ese parámetro.
+        // v7 (2026-11): la malla del pool se escribe con EscribirMallaV7: banderas bit1 = posiciones cuantizadas EMPAQUETADAS a bits por
+        // eje (paso 0,4 mm: float min[3], float size[3], byte bits[3], vc*(bx+by+bz) bits redondeados a byte), bit2 = índices en varint de
+        // marca de agua (int32 largo + bytes; 0 = vértice nuevo, c = reusa hw+1-c; vértices reordenados por primer uso), bit3 = normales
+        // octaédricas (2 x snorm8). Las instancias son como en v6.
+        // v6 (2026-11): (a) cada malla del pool lleva en el byte de banderas bit0 = índices uint16 y bit1 = posiciones
+        // CUANTIZADAS: float32 min[3], float32 size[3] y uint16 q[vc*3] (pos = min + q/65535*size) en lugar de float32 positions[vc*3];
+        // (b) cada instancia lleva, justo después de volume, un byte xf: 0 = float32 tx,ty,tz (como v5); 1 = float32 m[12]
+        // (M 3x3 por filas, luego t): vértice del mundo = M·pool + t, y la normal = normalize(M^-T · n). Así una malla se guarda una
+        // sola vez aunque sus copias estén giradas, espejadas o estiradas (codos, accesorios, tramos de tubería).
         //   Instancias × instCount:
         //           int32 meshIndex, int32 elementId, int32 categoryId, int32 materialIndex,
         //           (v4+) int32 familyIdx, int32 typeIdx,   // índice en la tabla de nombres, -1 = sin dato
@@ -1585,7 +1759,7 @@ namespace ConvertidorGeometrias
         static void ExportToViewerBin(List<MeshData> meshes, string path, PipelineStats stats)
         {
             const int MAGIC = 0x56544254; // "TBTV"
-            const int VERSION = 5;
+            const int VERSION = 7;
             // Tope del prefijo de longitud (uint16) de cada nombre de la tabla.
             const int NAME_MAX_BYTES = 65535;
             const float UNITS_PER_METER_OUT = 1.0f; // el pipeline siempre entrega metros de acá en más
@@ -1628,10 +1802,30 @@ namespace ConvertidorGeometrias
             // bucles de abajo seguían recorriendo `meshes` entero: los índices se desfasaban y
             // reventaba con IndexOutOfRangeException en cuanto el modelo tenía una habitación.
             var instSource = new List<MeshData>(meshes.Count);
+            // v6: matriz afín (12 doubles: M 3x3 por filas + t) de las instancias que son una copia girada/estirada de una malla del pool;
+            // null = sólo traslación (instDelta). Vértice del mundo = M·pool + t.
+            var instXf = new List<double[]>(meshes.Count);
+            // pieza ya procesada -> (malla del pool, traslación): para componer con las copias afines que la usan de representante
+            var pieceAt = new Dictionary<MeshData, (int pool, Vector3 delta)>();
 
             foreach (var m in meshes)
             {
                 if (m.Vertices == null || m.Vertices.Count == 0 || m.Indices.Count < 3) continue;
+
+                if (m.DedupRef != null && m.DedupM != null && pieceAt.TryGetValue(m.DedupRef, out var rp) && AfinVigente(m))
+                {
+                    var M = (double[])m.DedupM.Clone();
+                    // B = M·(pool + dr) + t = M·pool + (M·dr + t)
+                    M[9] += M[0] * rp.delta.X + M[1] * rp.delta.Y + M[2] * rp.delta.Z;
+                    M[10] += M[3] * rp.delta.X + M[4] * rp.delta.Y + M[5] * rp.delta.Z;
+                    M[11] += M[6] * rp.delta.X + M[7] * rp.delta.Y + M[8] * rp.delta.Z;
+                    instMeshIdx.Add(rp.pool);
+                    instDelta.Add(Vector3.Zero);
+                    instXf.Add(M);
+                    instSource.Add(m);
+                    stats.AfinEnPool++;
+                    continue;
+                }
 
                 var key = (m.MaterialId, m.Vertices.Count, m.Indices.Count, GeometryHash(m));
                 if (!poolKey.TryGetValue(key, out var cand))
@@ -1659,10 +1853,29 @@ namespace ConvertidorGeometrias
 
                 instMeshIdx.Add(found);
                 instDelta.Add(delta);
+                instXf.Add(null);
                 instSource.Add(m);
+                pieceAt[m] = (found, delta);
             }
 
             stats.PoolMeshes = pool.Count;
+
+            // Caja global de cada instancia: la del pool movida, o (con matriz) la de sus propios vértices.
+            var instMin = new List<Vector3>(instSource.Count);
+            var instMax = new List<Vector3>(instSource.Count);
+            for (int i = 0; i < instSource.Count; i++)
+            {
+                if (instXf[i] != null)
+                {
+                    GetBounds(instSource[i].Vertices, out var bmn, out var bmx);
+                    instMin.Add(bmn); instMax.Add(bmx);
+                }
+                else
+                {
+                    var (pmn, pmx) = poolBounds[instMeshIdx[i]];
+                    instMin.Add(pmn + instDelta[i]); instMax.Add(pmx + instDelta[i]);
+                }
+            }
 
             // v4: tabla de nombres deduplicada (familias y tipos juntos en la misma tabla).
             // Sólo se indexan los nombres de las instancias que REALMENTE se escriben, y nunca
@@ -1706,10 +1919,8 @@ namespace ConvertidorGeometrias
             Vector3 sMin = new Vector3(float.MaxValue), sMax = new Vector3(float.MinValue);
             for (int i = 0; i < instSource.Count; i++)
             {
-                var (mn, mx) = poolBounds[instMeshIdx[i]];
-                var d = instDelta[i];
-                sMin = Vector3.Min(sMin, mn + d);
-                sMax = Vector3.Max(sMax, mx + d);
+                sMin = Vector3.Min(sMin, instMin[i]);
+                sMax = Vector3.Max(sMax, instMax[i]);
             }
 
             // Sin ninguna instancia con geometría, el AABB queda invertido (MaxValue/MinValue)
@@ -1764,40 +1975,16 @@ namespace ConvertidorGeometrias
                 w.Write(archivoIdx); // v5: nombre del .rvt de origen (índice en la tabla, -1 = sin dato)
 
                 // Meshes del pool
-                foreach (var pm in pool)
-                {
-                    int vc = pm.Vertices.Count;
-                    int tc = pm.Indices.Count / 3;
-                    bool idx16 = vc <= 65535;
-
-                    w.Write(vc);
-                    w.Write((byte)(idx16 ? 1 : 0));
-                    w.Write(tc);
-
-                    for (int i = 0; i < vc; i++)
-                    {
-                        var v = pm.Vertices[i];
-                        w.Write(v.X); w.Write(v.Y); w.Write(v.Z);
-                    }
-                    for (int i = 0; i < vc; i++)
-                    {
-                        var n = i < pm.Normals.Count ? pm.Normals[i] : Vector3.UnitY;
-                        w.Write(Snorm(n.X)); w.Write(Snorm(n.Y)); w.Write(Snorm(n.Z));
-                    }
-                    if (idx16)
-                        foreach (var ix in pm.Indices) w.Write((ushort)ix);
-                    else
-                        foreach (var ix in pm.Indices) w.Write((uint)ix);
-                }
+                int poolIx = 0;
+                foreach (var pm in pool) EscribirMallaV7(w, pm, poolBounds[poolIx++]);
 
                 // Instancias
                 for (int i = 0; i < instSource.Count; i++)
                 {
                     var m = instSource[i];
-                    var (mn, mx) = poolBounds[instMeshIdx[i]];
                     var d = instDelta[i];
-                    var gmin = mn + d;
-                    var gmax = mx + d;
+                    var gmin = instMin[i];
+                    var gmax = instMax[i];
 
                     w.Write(instMeshIdx[i]);
                     w.Write(m.ElementId);
@@ -1809,7 +1996,18 @@ namespace ConvertidorGeometrias
                     w.Write(m.Area);        // v5: m² (NaN = sin parámetro)
                     w.Write(m.Length);      // v5: m
                     w.Write(m.Volume);      // v5: m³
-                    w.Write(d.X); w.Write(d.Y); w.Write(d.Z);
+                    // v6: 0 = sólo traslación (3 floats); 1 = matriz afín (M 3x3 por filas + t = 12 floats): mundo = M·pool + t
+                    var xf = instXf[i];
+                    if (xf == null)
+                    {
+                        w.Write((byte)0);
+                        w.Write(d.X); w.Write(d.Y); w.Write(d.Z);
+                    }
+                    else
+                    {
+                        w.Write((byte)1);
+                        for (int k = 0; k < 12; k++) w.Write((float)xf[k]);
+                    }
                     w.Write(gmin.X); w.Write(gmin.Y); w.Write(gmin.Z);
                     w.Write(gmax.X); w.Write(gmax.Y); w.Write(gmax.Z);
 
@@ -1822,6 +2020,146 @@ namespace ConvertidorGeometrias
             }
 
             stats.TbvBytes = new FileInfo(path).Length;
+        }
+
+        // Paso de cuantización objetivo de las posiciones (m): error <= 0,2 mm. Cada eje usa los bits que necesita (8..16) para ese paso.
+        const float PasoCuant = 0.0004f;
+
+        // v7: UNA malla del pool. Banderas: bit1 = posiciones cuantizadas y empaquetadas a bits por eje; bit2 = índices codificados como
+        // "marca de agua" en varint (con los vértices reordenados por primer uso); bit3 = normales octaédricas (2 bytes).
+        static void EscribirMallaV7(BinaryWriter w, MeshData pm, (Vector3 min, Vector3 max) bounds)
+        {
+            int n0 = pm.Vertices.Count;
+            // Vértices reordenados por primer uso en los índices (los que ningún triángulo usa se descartan).
+            var nuevo = new int[n0]; for (int i = 0; i < n0; i++) nuevo[i] = -1;
+            var orden = new List<int>(n0);
+            var idxNuevo = new int[pm.Indices.Count];
+            for (int k = 0; k < pm.Indices.Count; k++)
+            {
+                int x = pm.Indices[k];
+                if (nuevo[x] < 0) { nuevo[x] = orden.Count; orden.Add(x); }
+                idxNuevo[k] = nuevo[x];
+            }
+            int vc = orden.Count;
+            int tc = pm.Indices.Count / 3;
+
+            var min = bounds.min; var size = bounds.max - bounds.min;
+            bool cuant = Math.Max(size.X, Math.Max(size.Y, size.Z)) <= QuantMaxLado;
+            w.Write(vc);
+            w.Write((byte)((cuant ? 2 : 0) | 4 | 8));
+            w.Write(tc);
+
+            if (cuant)
+            {
+                int bx = BitsEje(size.X), by = BitsEje(size.Y), bz = BitsEje(size.Z);
+                w.Write(min.X); w.Write(min.Y); w.Write(min.Z);
+                w.Write(size.X); w.Write(size.Y); w.Write(size.Z);
+                w.Write((byte)bx); w.Write((byte)by); w.Write((byte)bz);
+                var bw = new BitWriter(w);
+                foreach (int src in orden)
+                {
+                    var v = pm.Vertices[src];
+                    bw.Put(CuantizarN(v.X, min.X, size.X, bx), bx);
+                    bw.Put(CuantizarN(v.Y, min.Y, size.Y, by), by);
+                    bw.Put(CuantizarN(v.Z, min.Z, size.Z, bz), bz);
+                }
+                bw.Flush();
+            }
+            else
+            {
+                foreach (int src in orden) { var v = pm.Vertices[src]; w.Write(v.X); w.Write(v.Y); w.Write(v.Z); }
+            }
+
+            foreach (int src in orden)
+            {
+                var n = src < pm.Normals.Count ? pm.Normals[src] : Vector3.UnitY;
+                OctEncode(n, out sbyte ox, out sbyte oy);
+                w.Write(ox); w.Write(oy);
+            }
+
+            // índices: 0 = vértice nuevo (hw+1); c >= 1 = reusa el vértice hw+1-c. Varint de 7 bits.
+            var ms = new MemoryStream(idxNuevo.Length + 16);
+            int hw = -1;
+            foreach (int x in idxNuevo)
+            {
+                uint c;
+                if (x > hw) { c = 0; hw = x; } else c = (uint)(hw + 1 - x);
+                while (c >= 128) { ms.WriteByte((byte)((c & 127) | 128)); c >>= 7; }
+                ms.WriteByte((byte)c);
+            }
+            w.Write((int)ms.Length);
+            w.Write(ms.GetBuffer(), 0, (int)ms.Length);
+        }
+
+        static int BitsEje(float size)
+        {
+            if (!(size > 0f)) return 0;
+            double niveles = Math.Ceiling(size / PasoCuant);
+            int b = (int)Math.Ceiling(Math.Log(Math.Max(2.0, niveles + 1), 2));
+            return Math.Max(1, Math.Min(16, b));
+        }
+
+        static uint CuantizarN(float v, float min, float size, int bits)
+        {
+            if (bits <= 0 || !(size > 0f)) return 0;
+            uint max = (1u << bits) - 1;
+            double q = Math.Round((v - min) / size * max);
+            return (uint)Math.Max(0.0, Math.Min(max, q));
+        }
+
+        // Octaédrica: normal unitaria -> 2 snorm8.
+        static void OctEncode(Vector3 n, out sbyte ox, out sbyte oy)
+        {
+            float l = Math.Abs(n.X) + Math.Abs(n.Y) + Math.Abs(n.Z);
+            if (!(l > 1e-12f)) { ox = 0; oy = 127; return; }
+            float px = n.X / l, py = n.Y / l;
+            if (n.Z < 0f)
+            {
+                float tx = (1f - Math.Abs(py)) * (px >= 0f ? 1f : -1f);
+                float ty = (1f - Math.Abs(px)) * (py >= 0f ? 1f : -1f);
+                px = tx; py = ty;
+            }
+            ox = (sbyte)Math.Max(-127, Math.Min(127, (int)Math.Round(px * 127f)));
+            oy = (sbyte)Math.Max(-127, Math.Min(127, (int)Math.Round(py * 127f)));
+        }
+
+        // Escritor de bits (MSB primero) sobre un BinaryWriter.
+        class BitWriter
+        {
+            readonly BinaryWriter _w; ulong _acc; int _n;
+            public BitWriter(BinaryWriter w) { _w = w; }
+            public void Put(uint v, int bits)
+            {
+                if (bits <= 0) return;
+                _acc = (_acc << bits) | (v & ((1u << bits) - 1)); _n += bits;
+                while (_n >= 8) { _n -= 8; _w.Write((byte)((_acc >> _n) & 0xFF)); }
+                _acc &= (1UL << _n) - 1;
+            }
+            public void Flush() { if (_n > 0) { _w.Write((byte)((_acc << (8 - _n)) & 0xFF)); _acc = 0; _n = 0; } }
+        }
+
+        // Lado mayor (m) hasta el que las posiciones del pool viajan cuantizadas a uint16 (error <= lado/65535 ~ 0,25 mm).
+        const float QuantMaxLado = 16f;
+
+        static ushort Cuantizar(float v, float min, float size)
+        {
+            if (!(size > 0f)) return 0;
+            double q = Math.Round((v - min) / size * 65535.0);
+            return (ushort)Math.Max(0.0, Math.Min(65535.0, q));
+        }
+
+        // ¿La pieza sigue siendo exactamente M·(malla final del representante)? (puede haber sido reemplazada o reparada en el medio)
+        static bool AfinVigente(MeshData m)
+        {
+            var rv = m.DedupRef.Vertices; var mv = m.Vertices;
+            if (rv.Count != mv.Count || m.DedupRef.Indices.Count != m.Indices.Count) return false;
+            for (int i = 0; i < rv.Count; i++)
+            {
+                var p = AplicarAfin(m.DedupM, rv[i]);
+                if (Math.Abs(p.X - mv[i].X) > 1e-3f || Math.Abs(p.Y - mv[i].Y) > 1e-3f || Math.Abs(p.Z - mv[i].Z) > 1e-3f) return false;
+            }
+            for (int i = 0; i < m.Indices.Count; i++) if (m.DedupRef.Indices[i] != m.Indices[i]) return false;
+            return true;
         }
 
         // Bloque OPCIONAL 'TXR1' al final del .tbv: una imagen (PNG con transparencia) por familia de Revit cuyo cuerpo exportado es
