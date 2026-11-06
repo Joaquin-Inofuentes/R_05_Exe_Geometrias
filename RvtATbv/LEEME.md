@@ -64,3 +64,9 @@ Herramientas: `comparar-tbv.mjs`, `diag-famtipo.mjs`, `diag-conjunto.mjs`, `diag
 ## Aviso sobre reviter
 La lectura de la geometría la hace [reviter](https://github.com/ahzs645/reviter), que **no declara licencia**: está bajado solo en `PruebasInternas\repos_terceros` para uso local;
 no se copió su código ni se redistribuye. Para entregar esto como producto hay que pedirle una licencia al autor o reimplementar la lectura.
+
+## CSV con medidas reales (2026-11-04)
+`rvt-a-csv.bat "C:\ruta\archivo.rvt"` → `PruebasInternas\salida\<nombre>\csv\`: `_1_crudo.csv`, `_2_profesional.csv` (una fila por elemento: tipología, variante de medida, `Ancho/Profundidad/Alto_Real_mm`, `Origen_Medidas`) y `_3_catalogo_variantes.csv` (una fila por variante). Sin Revit, sobre una copia.
+- Las medidas salen de las ranuras de parámetros del objeto de la instancia y de su tipo (`parametros.mjs`): `[8 B][double en pies][ff ff ff ff][id 0xFFF0xxxx][6 B]`; el id es un BuiltInParameter. Los nombres están en `herramientas\datos\nombres_parametros.json` (sacados una vez de Revit con `LabelUtils`).
+- Cobertura medida: HO_ARQ 467/1.357 elementos de familia; JU_DU 121/220. El resto queda con la caja envolvente de la malla (`Origen_Medidas`).
+- Separador `;`, decimales con coma, UTF-8 con BOM (Excel es-AR).
