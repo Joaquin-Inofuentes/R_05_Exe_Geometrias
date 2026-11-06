@@ -1,4 +1,4 @@
-<Project Sdk="Microsoft.NET.Sdk">
+﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
@@ -15,6 +15,11 @@
     <PackageReference Include="Costura.Fody" Version="5.7.0" PrivateAssets="all" />
   </ItemGroup>
 
+  <!-- Imagenes de personas/arbustos que el conversor incrusta como bloque 'TXR1' en cada .tbv (ver EscribirBloqueSprites). -->
+  <ItemGroup>
+    <None Include="sprites_fuente\*.png" Link="sprites\%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
   <Target Name="CleanUpOutputs" AfterTargets="Build">
     <ItemGroup>
       <FilesToDelete Include="$(OutputPath)*.dll" />
@@ -25,16 +30,45 @@
     <Delete Files="@(FilesToDelete)" />
   </Target>
 
-  <Target Name="InstallToMIP" AfterTargets="Build">
+  <!--
+    Copia de conveniencia a la instalación LOCAL de Revit (ProgramData). El instalador oficial
+    (MIP_Revit_Setup.exe) NO depende de este target: toma el binario directo de
+    PostProcesadoEXE\OptimizarDumpDeRevit.exe. Por eso un fallo acá (típicamente 'Acceso denegado'
+    si ProgramData está bloqueado o el exe está en uso por un Revit abierto) no debe tumbar la
+    compilación: el .exe ya se generó en el target Build anterior a este.
+  -->
+  <!--
+    2026-09-29: APAGADO por defecto (solo corre con /p:InstalarEnMIPLocal=true). Cada build recreaba
+    ProgramData\...\MIP\Executables\Geometria y sembraba un config.json VIEJO (con rutas absolutas de otra
+    instalacion) en %LOCALAPPDATA%\MIP, justo lo que rompio los exes el 2026-09-25. Los exes ahora los pone
+    UNICAMENTE MIP_Revit_Setup.exe en %LOCALAPPDATA%\MIP\Executables, y el config.json lo crea el addin.
+  -->
+  <Target Name="InstallToMIP" AfterTargets="Build" Condition="'$(InstalarEnMIPLocal)'=='true'">
     <PropertyGroup>
-      <MIPFolder>C:\ProgramData\Autodesk\Revit\Addins\2021\MIP</MIPFolder>
+      <!--
+        BINARIOS: ProgramData, la carpeta de add-ins de TODOS LOS USUARIOS, que es donde instala
+        MIP_Revit_Setup.exe desde la unificacion del 2026-09-01.
+        Hasta el 2026-09-04 esto decia $(AppData): la instalacion vieja POR USUARIO, que el propio
+        instalador borra en MigrarInstalacionVieja(). El comentario de arriba ya decia "ProgramData",
+        asi que se actualizo el comentario en la migracion y se olvido la propiedad. El efecto era
+        que compilar este proyecto RECREABA la carpeta legacy y dejaba ahi un exe y un bat fantasma.
+      -->
+      <MIPFolder>$(ProgramData)\Autodesk\Revit\Addins\2021\MIP</MIPFolder>
+      <!--
+        ESTADO EN RUNTIME (config.json): NO va junto a los binarios. El addin corre sin elevar dentro
+        de Revit y reescribe este archivo, asi que vive por-usuario en %LOCALAPPDATA%\MIP. Tiene que
+        coincidir con ConfigurationManager._runtimeDataFolder y con InstallerCore.RuntimeDataFolder:
+        si se separan, el addin lee un config.json distinto del que este target escribe.
+      -->
+      <MIPDataFolder>$(LocalAppData)\MIP</MIPDataFolder>
     </PropertyGroup>
-    <MakeDir Directories="$(MIPFolder)\Executables\Geometria" Condition="!Exists('$(MIPFolder)\Executables\Geometria')" />
-    <Copy SourceFiles="$(OutputPath)OptimizarDumpDeRevit.exe" DestinationFolder="$(MIPFolder)\Executables\Geometria" SkipUnchangedFiles="true" />
+    <MakeDir Directories="$(MIPFolder)\Executables\Geometria" Condition="!Exists('$(MIPFolder)\Executables\Geometria')" ContinueOnError="WarnAndContinue" />
+    <MakeDir Directories="$(MIPDataFolder)" Condition="!Exists('$(MIPDataFolder)')" ContinueOnError="WarnAndContinue" />
+    <Copy SourceFiles="$(OutputPath)OptimizarDumpDeRevit.exe" DestinationFolder="$(MIPFolder)\Executables\Geometria" SkipUnchangedFiles="true" ContinueOnError="WarnAndContinue" />
     <!-- Copies config.json if it does not already exist to prevent overwriting user modifications -->
-    <Copy SourceFiles="config.json" DestinationFolder="$(MIPFolder)" Condition="!Exists('$(MIPFolder)\config.json')" />
+    <Copy SourceFiles="config.json" DestinationFolder="$(MIPDataFolder)" Condition="!Exists('$(MIPDataFolder)\config.json')" ContinueOnError="WarnAndContinue" />
     <!-- Always copy the batch script -->
-    <Copy SourceFiles="copiar_resultados.bat" DestinationFolder="$(MIPFolder)" SkipUnchangedFiles="true" />
+    <Copy SourceFiles="copiar_resultados.bat" DestinationFolder="$(MIPFolder)" SkipUnchangedFiles="true" ContinueOnError="WarnAndContinue" />
   </Target>
 
 </Project>

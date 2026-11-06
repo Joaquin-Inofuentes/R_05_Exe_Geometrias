@@ -10,3 +10,30 @@ WebEjemplo/node_modules/
 WebEjemplo/screenshots/
 scratch_*.js
 /_Docs_IA
+
+/_Documentos generados
+_Documentos generados/
+_Documentos generados
+
+# Pruebas internas: copias de .rvt de ARQ (pesadas, no van al repo)
+PruebasInternas/
+
+# --- secretos (seguridad 2026-11-04) ---
+credentials*.json
+service-account*.json
+test_credentials*.json
+secrets*.json
+*.env
+.env
+.env.*
+!.env.example
+!.env.*.example
+.dev.vars
+.dev.vars.*
+*.pem
+*.key
+*.pfx
+*.p12
+R2_TOKEN*.txt
+secreto*.txt
+.vercel/

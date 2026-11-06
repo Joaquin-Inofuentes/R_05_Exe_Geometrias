@@ -19,7 +19,8 @@
     "ExportarMashas": true,
     "ExportarGeometria": true,
     "MainImageScale": 1.0,
-    "ImageRenderDpi": 150
+    "ImageRenderDpi": 150,
+    "IgnorarCrcPlanos": true
   },
   "System": {
     "OmitirLosYaExportados": false,

@@ -31,9 +31,39 @@ namespace ConvertidorGeometrias
         // Color superficial simple del material de Revit (formato v2+). Alpha < 255 = vidrio/transparente.
         public byte ColR = 200, ColG = 200, ColB = 200, ColA = 255;
         public bool HasColor;
+
+        // Patrón de superficie vectorial del material (formato v6+), sólo en muros.
+        // Ángulo en radianes y separación entre líneas en METROS. El visor lo redibuja
+        // por fragmento en el shader; acá sólo se transporta. Separación <= 0 = sin hatch.
+        public float HatchAngle;
+        public float HatchSpacing;
+        public bool HasHatch { get { return HatchSpacing > 0f; } }
+
+        // Nombre de Familia y de Tipo del ElementType de Revit (formato .bin v7+).
+        // "" = el elemento no tiene tipo (habitaciones, geometría in-situ) o el .bin es v6 o
+        // anterior. En el .tbv se deduplican en una tabla de nombres; "" se escribe como -1.
+        // CUIDADO: cada vez que se construye un MeshData a partir de otro (fusión por pieza,
+        // clonado con normales, decimado) hay que copiar estos dos campos o el nombre se pierde
+        // en silencio y el visor muestra la ficha vacía sin ningún error.
+        public string FamilyName = "";
+        public string TypeName = "";
+        // Formato .bin v8+: nivel y área (m²) / longitud (m) / volumen (m³) leídos por el addin de
+        // PARÁMETROS de Revit. NaN = el elemento no los expone. Mismo CUIDADO que arriba: copiarlos
+        // en cada clonado (CopiarPropiedadesDe) o el visor muestra "—" sin ningún error.
+        public string Level = "";
+        public float Area = float.NaN, Length = float.NaN, Volume = float.NaN;
+        public void CopiarPropiedadesDe(MeshData o)
+        {
+            Level = o.Level; Area = o.Area; Length = o.Length; Volume = o.Volume;
+        }
         public List<Vector3> Vertices = new List<Vector3>();
         public List<Vector3> Normals = new List<Vector3>();
         public List<int> Indices = new List<int>();
+
+        // Dedup afín (v6): esta pieza es la malla final de DedupRef transformada por DedupM (3x3 fila a fila + traslación, 12 doubles).
+        // Sólo es una pista: ExportToViewerBin la vuelve a verificar contra los vértices reales antes de usarla.
+        public MeshData DedupRef;
+        public double[] DedupM;
 
         // v4: Metadata de habitaciones (solo si CategoryId == -2000160 / OST_Rooms)
         public string RoomLevel = "";
@@ -44,6 +74,7 @@ namespace ConvertidorGeometrias
     public class PipelineStats
     {
         public int FormatVersion = 1;
+        public string ArchivoRvt = "";   // .bin v8+: nombre del .rvt de origen
         public string UnidadOrigen = "";
         public Vector3 PuntoBase;
         public int Rooms;          // habitaciones con centroide válido en el JSON
@@ -62,7 +93,10 @@ namespace ConvertidorGeometrias
         public int Instanced;      // piezas que reusan la malla de otra idéntica (GLB más chico)
         public int Repaired;       // piezas rotas reparadas restaurando su geometría original
         public int PoolMeshes;     // geometrías únicas en el .tbv tras deduplicar
+        public int AfinDedup;      // piezas que reusan la malla (ya decimada) de otra idéntica salvo rotación/escala/espejo
+        public int AfinEnPool;     // de esas, las que el .tbv guardó como instancia con matriz
         public long TbvBytes;      // tamaño del binario de visor
+        public int HatchedMats;    // materiales con patrón de superficie (hatch) en el .tbv
     }
 
     public class PiezaRota
@@ -123,15 +157,25 @@ namespace ConvertidorGeometrias
         }
 
         private const string APP_GUID = "Global\\RevitGeometriaWatcher_JPG_2024";
-        private static string CARPETA_TEMP = @"C:\ProgramData\Autodesk\Revit\Addins\2021\MIP\Temp";
+        private static string CARPETA_TEMP = System.IO.Path.Combine(System.IO.Path.Combine(System.Environment.GetFolderPath(System.Environment.SpecialFolder.LocalApplicationData), "MIP"), "Temp");
         private static string RUTA_BASE_SALIDA = @"C:\NO ENTRAR\JPG\DATA";
         private static string RUTA_LOG = "";
 
+        // Máximo de reintentos antes de dar un .bin por perdido definitivamente.
+        const int MAX_REINTENTOS_FALLIDOS = 2;
+
         static void Main(string[] args)
         {
-            if (args.Length > 1 && !string.IsNullOrWhiteSpace(args[1]))
+            if (args.Length > 0 && !string.IsNullOrWhiteSpace(args[0]))
             {
-                RUTA_BASE_SALIDA = Path.Combine(args[1], "DATA");
+                // La carpeta Temp se DERIVA del plugin folder que pasa el addin, en vez de estar
+                // hardcodeada. Si en una máquina el config.json tiene otro BasePluginFolder/TempFolderPath
+                // (el instalador preserva configs viejos), el addin escribía los .bin en una carpeta que
+                // este watcher jamás miraba: los .tbv y los JSON de habitaciones no aparecían nunca y no
+                // había ningún error visible en ningún lado.
+                CARPETA_TEMP = Path.Combine(args[0], "Temp");
+                _basePluginFolder = args[0];   // T07: ProgresoLotes lee tomados_*.txt de aca
+                _sufijoMutex = SufijoMutexInstalacion(args[0]);   // T14: build lado a lado
                 RUTA_LOG = Path.Combine(args[0], "Logs", $"Log_Geometria_{DateTime.Now:yyyy-MM-dd}.txt");
             }
             else
@@ -139,13 +183,16 @@ namespace ConvertidorGeometrias
                 RUTA_LOG = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, $"Log_Geometria_{DateTime.Now:yyyy-MM-dd}.txt");
             }
 
+            if (args.Length > 1 && !string.IsNullOrWhiteSpace(args[1]))
+            {
+                RUTA_BASE_SALIDA = Path.Combine(args[1], "DATA");
+            }
+
             Console.OutputEncoding = Encoding.UTF8;
-            Log("============================================================");
-            Log("        REVIT GEOMETRIAS WATCHER - INICIANDO");
-            Log("============================================================");
+            Log("=== POST-PROCESO DE GEOMETRIAS - INICIANDO ===");
 
             bool createdNew;
-            using (Mutex mutex = new Mutex(true, APP_GUID, out createdNew))
+            using (Mutex mutex = new Mutex(true, APP_GUID + _sufijoMutex, out createdNew))
             {
                 if (!createdNew)
                 {
@@ -155,10 +202,24 @@ namespace ConvertidorGeometrias
 
                 if (!Directory.Exists(CARPETA_TEMP)) Directory.CreateDirectory(CARPETA_TEMP);
                 if (!Directory.Exists(RUTA_BASE_SALIDA)) Directory.CreateDirectory(RUTA_BASE_SALIDA);
+                try { Directory.CreateDirectory(Path.GetDirectoryName(RUTA_LOG)); } catch { }
 
-                Log(" [|] TEMP: " + CARPETA_TEMP);
-                Log(" [F2] DATA: " + RUTA_BASE_SALIDA);
-                Log("------------------------------------------------------------");
+                Consola.Encabezado(
+                    "POST-PROCESO DE GEOMETRIAS",
+                    "Suelda y diezma (QEM) la geometria que vuelca Revit, valida y repara las piezas rotas, y publica el .tbv del visor 3D mas el JSON de habitaciones.",
+                    new[]
+                    {
+                        new[] { "Entrada", CARPETA_TEMP,      "|"  },
+                        new[] { "Salida",  RUTA_BASE_SALIDA,  "F2" },
+                        new[] { "Log",     RUTA_LOG,          "L"  }
+                    });
+                Log("TEMP: " + CARPETA_TEMP + " | DATA: " + RUTA_BASE_SALIDA);
+
+                // Al arrancar se reinyectan los .bin apartados que todavía tienen reintentos: un fallo
+                // transitorio (archivo a medio escribir porque Revit murió, pico de memoria) dejaba el
+                // proyecto sin .tbv ni JSON de habitaciones PARA SIEMPRE, sin reintento ni aviso.
+                ReintentarFallidos();
+                DateTime ultimaPasadaFallidos = DateTime.Now;
 
                 while (true)
                 {
@@ -173,9 +234,55 @@ namespace ConvertidorGeometrias
                             ProcesarArchivo(filePath);
                         }
                     }
+
+                    // Barrido periódico de apartados: el exe es perpetuo, así que esperar al próximo
+                    // arranque para reintentar puede ser esperar días.
+                    if ((DateTime.Now - ultimaPasadaFallidos).TotalMinutes >= 10)
+                    {
+                        ReintentarFallidos();
+                        ultimaPasadaFallidos = DateTime.Now;
+                    }
+
+                    Consola.Esperando(0);
+                    Consola.Esperando(0);
                     Thread.Sleep(500); // Pausa de escucha
                 }
             }
+        }
+
+        // T14 (build lado a lado MIP_UNBOX): si la carpeta personal que pasa el addin (args[0]) NO es %LOCALAPPDATA%\MIP, es una
+        // instalacion de prueba y el mutex lleva un sufijo propio, asi este exe no pelea la instancia unica con el watcher productivo
+        // (su cola Temp ya sale de args[0]). En produccion (args[0] == %LOCALAPPDATA%\MIP) el sufijo es "" y el nombre no cambia.
+        // Misma formula que CarpetaPersonalMip.SufijoMutex (R_01).
+        private static string _sufijoMutex = "";
+        private static string SufijoMutexInstalacion(string basePluginFolder)
+        {
+            try
+            {
+                string real = Path.GetFullPath(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "MIP")).TrimEnd('\\');
+                string p = Path.GetFullPath(basePluginFolder).TrimEnd('\\');
+                if (string.Equals(p, real, StringComparison.OrdinalIgnoreCase)) return "";
+                using (var sha = System.Security.Cryptography.SHA256.Create())
+                {
+                    byte[] h = sha.ComputeHash(Encoding.UTF8.GetBytes(p.ToLowerInvariant()));
+                    return "_" + h[0].ToString("x2") + h[1].ToString("x2") + h[2].ToString("x2") + h[3].ToString("x2");
+                }
+            }
+            catch { return ""; }
+        }
+
+        // T07: avance del lote "[N/M] hechos H ..." (ProgresoLotes.cs, copia de R_01/tools/_compartido). Solo informativo:
+        // cualquier falla => "" y el exe sigue exactamente igual.
+        private static string _basePluginFolder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "MIP");
+        private static string LineaProgreso(string nombreProyecto)
+        {
+            try
+            {
+                int bins = -1;
+                try { bins = Directory.GetFiles(CARPETA_TEMP, "*.bin").Length; } catch { }
+                return UnboxCompartido.ProgresoLotes.LineaPara(_basePluginFolder, nombreProyecto, bins);
+            }
+            catch { return ""; }
         }
 
         private static bool EstaBloqueado(string path)
@@ -189,9 +296,13 @@ namespace ConvertidorGeometrias
 
         private static void ProcesarArchivo(string filePath)
         {
-            Log($"\n==================================================");
-            Log($"Procesando: {Path.GetFileName(filePath)}");
-            Log($"==================================================");
+            int intentoIgnorado0;
+            string nombreProyecto = SepararNombreEIntento(
+                Path.GetFileNameWithoutExtension(filePath), out intentoIgnorado0).Replace("_Geometria", "");
+
+            Log($"===== Procesando: {Path.GetFileName(filePath)} =====");
+            Consola.Detalle(LineaProgreso(nombreProyecto));   // T07: [N/M] del lote
+            Consola.FilaInicio(nombreProyecto, "leyendo dump");
 
             try
             {
@@ -202,17 +313,19 @@ namespace ConvertidorGeometrias
                 List<MeshData> meshes = LeerBinario(filePath, stats);
                 Log($"Formato v{stats.FormatVersion}{(stats.FormatVersion >= 2 ? " (con color de material)" : " (legado, colores aleatorios)")}. Se leyeron {meshes.Count} mallas.");
 
-                Console.WriteLine("Agrupando, soldando y diezmando (QEM) geometría...");
+                // Los porcentajes son las etapas del pipeline, no un conteo de piezas: no hay una
+                // unidad de avance comun entre soldar, diezmar, validar y escribir.
+                Consola.FilaProgreso(20, "soldando y diezmando");
                 var weldedOriginals = new Dictionary<string, MeshData>();
                 List<MeshData> optimizedMeshes = OptimizeMeshes(meshes, stats, weldedOriginals);
-                Console.WriteLine($"Geometría reducida a {optimizedMeshes.Count} piezas separadas.");
+                Log($"Geometría reducida a {optimizedMeshes.Count} piezas separadas.");
 
-                Console.WriteLine("Validando piezas...");
+                Consola.FilaProgreso(55, "validando piezas");
                 var rotasDetectadas = ValidarPiezas(weldedOriginals, optimizedMeshes);
 
                 if (rotasDetectadas.Count > 0)
                 {
-                    Console.WriteLine($"Se detectaron {rotasDetectadas.Count} piezas rotas. Reparando...");
+                    Log($"Se detectaron {rotasDetectadas.Count} piezas rotas. Reparando...");
                     RepararPiezas(rotasDetectadas, weldedOriginals, optimizedMeshes, stats);
                 }
 
@@ -224,17 +337,24 @@ namespace ConvertidorGeometrias
                 stats.TrisOut = optimizedMeshes.Sum(m => (long)m.Indices.Count / 3);
                 stats.OutputPieces = optimizedMeshes.Count;
 
-                string baseName = Path.GetFileNameWithoutExtension(filePath).Replace("_Geometria", "");
+                // Se saca el sufijo "__intentoN" que agrega el reintento de apartados: sin esto, un
+                // archivo reinyectado escribiría "SO_DU__intento1_Geometria.tbv" en vez de pisar el
+                // nombre real, y el visor nunca encontraría el archivo del proyecto.
+                int intentoIgnorado;
+                string baseName = SepararNombreEIntento(
+                    Path.GetFileNameWithoutExtension(filePath), out intentoIgnorado).Replace("_Geometria", "");
 
                 // Las habitaciones se exportan PRIMERO: son un JSON chico e independiente, y si
                 // el escritor del .tbv falla no tiene por qué llevárselas puestas.
                 string roomsPath = Path.Combine(RUTA_BASE_SALIDA, baseName + "_Geometria_Habitaciones.json");
-                Console.WriteLine($"Exportando data de habitaciones: {roomsPath}");
+                Consola.FilaProgreso(75, "exportando ambientes");
+                Log($"Exportando data de habitaciones: {roomsPath}");
                 ExportRoomsJson(optimizedMeshes, roomsPath, stats);
 
                 string tbvPath = Path.Combine(RUTA_BASE_SALIDA, baseName + "_Geometria.tbv");
 
-                Console.WriteLine($"Exportando binario de visor (dedup + índice espacial): {tbvPath}");
+                Consola.FilaProgreso(90, "escribiendo tbv");
+                Log($"Exportando binario de visor (dedup + índice espacial): {tbvPath}");
                 ExportToViewerBin(optimizedMeshes, tbvPath, stats);
 
                 string reportPath = Path.Combine(RUTA_BASE_SALIDA, baseName + "_Geometria_reporte.txt");
@@ -245,35 +365,76 @@ namespace ConvertidorGeometrias
                 File.WriteAllText(reportPath, reporte);
                 Log($"Reporte guardado en: {reportPath}");
 
+                Consola.Detalle(LineaProgreso(nombreProyecto));   // T07
+                Consola.FilaFin(nombreProyecto, swFile.Elapsed, true,
+                    $"{stats.OutputPieces} piezas" + (rotasFinales.Count > 0 ? $", {rotasFinales.Count} rota(s)" : ""));
+
                 if (File.Exists(filePath)) File.Delete(filePath);
             }
             catch (Exception ex)
             {
-                Log("\n !!! FALLA: " + ex.Message + "\n" + ex.StackTrace);
+                Log(" !!! FALLA: " + ex.Message + "\n" + ex.StackTrace);
+                Consola.Detalle(LineaProgreso(nombreProyecto));   // T07
+                Consola.FilaFin(nombreProyecto, TimeSpan.Zero, false, ex.Message);
 
                 // El .bin es irreproducible sin volver a exportar desde Revit: en vez de
                 // borrarlo se aparta, para poder diagnosticar y reprocesar.
                 ApartarFallido(filePath);
             }
+            finally
+            {
+                LiberarMemoriaEntreModelos();
+            }
         }
 
+        // Este proceso es un watcher perpetuo y las mallas son arrays > 85 KB: viven en el LOH,
+        // que el GC no compacta solo. Sin esto el proceso queda en reposo con el residuo del
+        // último modelo grande (medido: ~600 MB tras un IS de 8 M de vértices).
+        private static void LiberarMemoriaEntreModelos()
+        {
+            long antes = GC.GetTotalMemory(false);
+            System.Runtime.GCSettings.LargeObjectHeapCompactionMode =
+                System.Runtime.GCLargeObjectHeapCompactionMode.CompactOnce;
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            GC.Collect();
+            long despues = GC.GetTotalMemory(false);
+            Log($"[MEM] Managed: {antes / 1048576} MB -> {despues / 1048576} MB | Privada: {Process.GetCurrentProcess().PrivateMemorySize64 / 1048576} MB");
+        }
+
+        private static string CarpetaFallidos => Path.Combine(CARPETA_TEMP, "_Fallidos");
+
         // Mueve un .bin que no se pudo procesar a "_Fallidos" junto al TEMP, para que el
-        // watcher no lo reintente en bucle pero tampoco se pierda.
+        // watcher no lo reintente en bucle pero tampoco se pierda. El nombre lleva el número de
+        // intento (__intentoN) para poder reinyectarlo después: sin contador, o se reintenta para
+        // siempre en bucle, o —como pasaba antes— no se reintenta nunca y el proyecto queda sin
+        // .tbv y sin JSON de habitaciones de forma permanente y silenciosa.
         private static void ApartarFallido(string filePath)
         {
             try
             {
                 if (!File.Exists(filePath)) return;
 
-                string carpeta = Path.Combine(CARPETA_TEMP, "_Fallidos");
-                Directory.CreateDirectory(carpeta);
+                Directory.CreateDirectory(CarpetaFallidos);
 
-                string destino = Path.Combine(
-                    carpeta,
-                    $"{Path.GetFileNameWithoutExtension(filePath)}_{DateTime.Now:yyyyMMdd_HHmmss}.bin");
+                int intento;
+                string baseName = SepararNombreEIntento(Path.GetFileNameWithoutExtension(filePath), out intento);
+                intento++;
 
+                string destino = Path.Combine(CarpetaFallidos, $"{baseName}__intento{intento}.bin");
+                if (File.Exists(destino)) File.Delete(destino);
                 File.Move(filePath, destino);
-                Log($"Archivo apartado para diagnóstico: {destino}");
+
+                if (intento > MAX_REINTENTOS_FALLIDOS)
+                {
+                    Log($"!!! DESCARTADO DEFINITIVAMENTE tras {intento} intentos: {destino}");
+                    Log($"!!! El proyecto '{baseName}' NO tiene .tbv ni JSON de habitaciones actualizados. " +
+                        "Hay que volver a exportarlo desde Revit.");
+                }
+                else
+                {
+                    Log($"Archivo apartado (intento {intento}/{MAX_REINTENTOS_FALLIDOS}), se reintentará: {destino}");
+                }
             }
             catch (Exception ex)
             {
@@ -283,9 +444,61 @@ namespace ConvertidorGeometrias
             }
         }
 
+        // Devuelve el nombre base sin el sufijo "__intentoN" y saca por 'out' el N encontrado (0 si no había).
+        private static string SepararNombreEIntento(string nombreSinExtension, out int intento)
+        {
+            intento = 0;
+            const string marca = "__intento";
+
+            int pos = nombreSinExtension.LastIndexOf(marca, StringComparison.Ordinal);
+            if (pos < 0) return nombreSinExtension;
+
+            string cola = nombreSinExtension.Substring(pos + marca.Length);
+            int parsed;
+            if (!int.TryParse(cola, out parsed)) return nombreSinExtension;
+
+            intento = parsed;
+            return nombreSinExtension.Substring(0, pos);
+        }
+
+        // Devuelve a la cola los .bin apartados que todavía tienen reintentos disponibles.
+        // Los que agotaron los intentos se dejan quietos en _Fallidos para diagnóstico.
+        private static void ReintentarFallidos()
+        {
+            try
+            {
+                if (!Directory.Exists(CarpetaFallidos)) return;
+
+                foreach (string apartado in Directory.GetFiles(CarpetaFallidos, "*.bin"))
+                {
+                    int intento;
+                    string baseName = SepararNombreEIntento(Path.GetFileNameWithoutExtension(apartado), out intento);
+
+                    if (intento > MAX_REINTENTOS_FALLIDOS) continue; // ya se descartó, no insistir
+
+                    // Vuelve a la cola conservando el contador en el nombre, para que un nuevo fallo
+                    // lo incremente en vez de reiniciar el ciclo desde cero.
+                    string destino = Path.Combine(CARPETA_TEMP, $"{baseName}__intento{intento}.bin");
+                    if (File.Exists(destino)) continue; // ya hay uno en cola para ese proyecto
+
+                    File.Move(apartado, destino);
+                    Log($"Reinyectado a la cola (intento {intento + 1}/{MAX_REINTENTOS_FALLIDOS}): {Path.GetFileName(destino)}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Log("No se pudieron reintentar los archivos apartados: " + ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// Traza al ARCHIVO unicamente. La consola no la escribe esto: la dibuja Consola, que
+        /// mantiene un renglon por proyecto. Antes cada Log() ademas escupia su linea a la
+        /// consola, y una corrida dejaba decenas de renglones de detalle interno por proyecto
+        /// entre los que no se encontraba el estado real de ninguno.
+        /// </summary>
         private static void Log(string msg)
         {
-            Console.WriteLine(msg);
             try
             {
                 if (!string.IsNullOrEmpty(RUTA_LOG))
@@ -319,6 +532,11 @@ namespace ConvertidorGeometrias
             sb.AppendLine($"Materiales transparentes (vidrio): {s.Transparent}");
             sb.AppendLine($"Piezas instanciadas (malla compartida): {s.Instanced}");
             sb.AppendLine($"Geometrías únicas en el .tbv (dedup): {s.PoolMeshes} de {s.OutputPieces} piezas");
+            sb.AppendLine($"Piezas reusadas con rotación/escala (dedup afín, sin decimar de nuevo): {s.AfinDedup}; guardadas como matriz en el .tbv: {s.AfinEnPool}");
+            sb.AppendLine($"Materiales con patrón de superficie (hatch de muros): {s.HatchedMats}" +
+                          (s.HatchedMats == 0 && s.FormatVersion >= 6
+                              ? " -- ningún material de muro tenía un patrón de MODELO utilizable"
+                              : ""));
             if (s.TbvBytes > 0) sb.AppendLine($"Binario de visor (.tbv): {s.TbvBytes / 1024:N0} KB");
 
             sb.AppendLine($"Tiempo total: {elapsed.TotalSeconds:F1} s");
@@ -488,7 +706,9 @@ namespace ConvertidorGeometrias
                 else finales.Add(reparada);
 
                 stats.Repaired++;
-                Console.WriteLine($"  Reparada: ElementId {rota.ElementId} | {rota.Problema}");
+                // Al log, no a la consola: partiria el renglon del proyecto en curso. El conteo
+                // de reparadas sale igual en el reporte y en el detalle del renglon.
+                Log($"  Reparada: ElementId {rota.ElementId} | {rota.Problema}");
             }
         }
 
@@ -502,12 +722,15 @@ namespace ConvertidorGeometrias
                 CategoryId = src.CategoryId,
                 ColR = src.ColR, ColG = src.ColG, ColB = src.ColB, ColA = src.ColA,
                 HasColor = src.HasColor,
+                HatchAngle = src.HatchAngle, HatchSpacing = src.HatchSpacing,
+                FamilyName = src.FamilyName, TypeName = src.TypeName,
                 RoomLevel = src.RoomLevel,
                 RoomDepartment = src.RoomDepartment,
                 RoomName = src.RoomName,
                 Vertices = new List<Vector3>(src.Vertices),
                 Indices = new List<int>(src.Indices)
             };
+            clon.CopiarPropiedadesDe(src);
             ComputeNormals(clon);
             return clon;
         }
@@ -528,6 +751,7 @@ namespace ConvertidorGeometrias
             // pieza por material, cada una con su color y su protección de vidrio correctas.
             var grouped = inputMeshes.GroupBy(m => m.PieceKey);
             var optimizedList = new List<MeshData>();
+            var afinReps = new Dictionary<(int, int, int, int, long), List<RepAfin>>();
 
             foreach (var group in grouped)
             {
@@ -540,12 +764,19 @@ namespace ConvertidorGeometrias
                     CategoryId = first.CategoryId,
                     ColR = first.ColR, ColG = first.ColG, ColB = first.ColB, ColA = first.ColA,
                     HasColor = first.HasColor,
+                    // Todas las caras del grupo comparten (GUID, MaterialId), así que comparten
+                    // material y por lo tanto patrón: el de la primera vale para la pieza entera.
+                    HatchAngle = first.HatchAngle, HatchSpacing = first.HatchSpacing,
+                    // Todas las caras del grupo son del MISMO elemento (el PieceKey empieza por
+                    // el GUID), así que familia y tipo de la primera valen para la pieza entera.
+                    FamilyName = first.FamilyName, TypeName = first.TypeName,
                     // Sin esto la metadata de habitación se pierde acá y el JSON sale con
                     // Level/Department/Name vacíos (el visor descarta las que no tienen Level).
                     RoomLevel = first.RoomLevel,
                     RoomDepartment = first.RoomDepartment,
                     RoomName = first.RoomName
                 };
+                mergedMesh.CopiarPropiedadesDe(first); // v8: nivel, área, longitud, volumen
 
                 int vertexOffset = 0;
                 foreach (var mesh in group)
@@ -556,6 +787,11 @@ namespace ConvertidorGeometrias
                         mergedMesh.Indices.Add(index + vertexOffset);
                     }
                     vertexOffset += mesh.Vertices.Count;
+                    // Ya se copió a mergedMesh y nadie vuelve a leer la malla de entrada; soltar las
+                    // listas acá evita tener el dump entero vivo junto a su copia fusionada
+                    // (~220 MB en un modelo de instalaciones de 8 M de vértices).
+                    mesh.Vertices = null;
+                    mesh.Indices = null;
                 }
 
                 stats.VertsIn += mergedMesh.Vertices.Count;
@@ -576,6 +812,22 @@ namespace ConvertidorGeometrias
                 {
                     stats.Discarded++;
                     continue;
+                }
+
+                // Dedup afín ANTES de decimar: si esta pieza es otra ya procesada rotada / espejada / estirada (mismos vértices
+                // en el mismo orden y mismos índices, a una transformación afín), no se decima de nuevo: reusa la malla final
+                // de aquélla transformada. Es lo que permite al .tbv guardarla UNA vez (decimada igual para todas las copias).
+                if (mergedMesh.CategoryId != CatRooms)
+                {
+                    var afin = IntentarDedupAfin(mergedMesh, afinReps);
+                    if (afin != null)
+                    {
+                        stats.AfinDedup++;
+                        stats.VertsOut += afin.Vertices.Count;
+                        stats.TrisOut += afin.Indices.Count / 3;
+                        optimizedList.Add(afin);
+                        continue;
+                    }
                 }
 
                 int originalTriangles = mergedMesh.Indices.Count / 3;
@@ -641,11 +893,151 @@ namespace ConvertidorGeometrias
                 stats.VertsOut += outMesh.Vertices.Count;
                 stats.TrisOut += outMesh.Indices.Count / 3;
                 optimizedList.Add(outMesh);
+                if (mergedMesh.CategoryId != CatRooms) RegistrarRepAfin(mergedMesh, outMesh, afinReps);
             }
 
             stats.OutputPieces = optimizedList.Count;
             return optimizedList;
         }
+
+        // ================== DEDUP AFÍN ==================
+        // Una malla B es "copia afín" de A si tiene los mismos índices y B.v[i] = M·A.v[i] + t para TODO vértice (M 3x3 cualquiera:
+        // rotación, espejo, escala distinta por eje, hasta cizalla). Cubre codos y accesorios girados, y tramos rectos de tubería del
+        // mismo diámetro y distinto largo. Se resuelve M con 4 vértices bien condicionados de A y se verifica con TODOS los de B.
+        const double EpsAfin = 2e-4;   // 0,2 mm
+
+        class RepAfin
+        {
+            public MeshData Welded;    // la malla soldada original (entrada de la decimación)
+            public MeshData Final;     // lo que salió (decimada o no): es lo que se transforma
+            public int[] B;            // 4 índices de vértice
+            public double[] InvEa;     // inversa (3x3, por filas) de la matriz de aristas de A
+        }
+
+        static long HashIndices(List<int> ix)
+        {
+            unchecked
+            {
+                long h = 1469598103934665603;
+                foreach (var i in ix) h = (h ^ i) * 1099511628211;
+                return h;
+            }
+        }
+
+        static (int, int, int, int, long) ClaveAfin(MeshData m) =>
+            (m.CategoryId, m.MaterialId, m.Vertices.Count, m.Indices.Count, HashIndices(m.Indices));
+
+        static void RegistrarRepAfin(MeshData welded, MeshData final, Dictionary<(int, int, int, int, long), List<RepAfin>> reps)
+        {
+            if (welded.Vertices.Count < 4 || final.Vertices.Count < 4) return;
+            if (!BaseAfin(welded.Vertices, out var idx, out var inv)) return;
+            var key = ClaveAfin(welded);
+            if (!reps.TryGetValue(key, out var lista)) { lista = new List<RepAfin>(); reps[key] = lista; }
+            lista.Add(new RepAfin { Welded = welded, Final = final, B = idx, InvEa = inv });
+        }
+
+        // 4 vértices que forman un tetraedro bien condicionado; false si la malla es plana o degenerada (ahí no hay afín único).
+        static bool BaseAfin(List<Vector3> v, out int[] idx, out double[] inv)
+        {
+            idx = null; inv = null;
+            int n = v.Count;
+            var a = v[0];
+            int i1 = 0; double d1 = -1;
+            for (int i = 1; i < n; i++) { double d = (v[i] - a).LengthSquared(); if (d > d1) { d1 = d; i1 = i; } }
+            if (d1 < 1e-12) return false;
+            var e1 = v[i1] - a;
+            int i2 = 0; double c2 = -1;
+            for (int i = 0; i < n; i++) { double c = Vector3.Cross(e1, v[i] - a).LengthSquared(); if (c > c2) { c2 = c; i2 = i; } }
+            if (c2 < 1e-16) return false;
+            var e2 = v[i2] - a;
+            var nrm = Vector3.Cross(e1, e2);
+            int i3 = 0; double c3 = -1;
+            for (int i = 0; i < n; i++) { double c = Math.Abs(Vector3.Dot(nrm, v[i] - a)); if (c > c3) { c3 = c; i3 = i; } }
+            var e3 = v[i3] - a;
+            if (c3 < 1e-4 * Math.Sqrt(e1.LengthSquared()) * Math.Sqrt(e2.LengthSquared()) * Math.Sqrt(e3.LengthSquared())) return false;
+            // Ea tiene por COLUMNAS e1,e2,e3
+            double[] ea = { e1.X, e2.X, e3.X, e1.Y, e2.Y, e3.Y, e1.Z, e2.Z, e3.Z };
+            inv = Inv3(ea);
+            if (inv == null) return false;
+            idx = new[] { 0, i1, i2, i3 };
+            return true;
+        }
+
+        static double[] Inv3(double[] m)
+        {
+            double a = m[0], b = m[1], c = m[2], d = m[3], e = m[4], f = m[5], g = m[6], h = m[7], i = m[8];
+            double A = e * i - f * h, B = -(d * i - f * g), C = d * h - e * g;
+            double det = a * A + b * B + c * C;
+            if (Math.Abs(det) < 1e-18) return null;
+            return new[] { A / det, -(b * i - c * h) / det, (b * f - c * e) / det,
+                           B / det, (a * i - c * g) / det, -(a * f - c * d) / det,
+                           C / det, -(a * h - b * g) / det, (a * e - b * d) / det };
+        }
+
+        // Devuelve la pieza B como transformación afín de la malla final de un representante, o null si no encaja con ninguno.
+        static MeshData IntentarDedupAfin(MeshData b, Dictionary<(int, int, int, int, long), List<RepAfin>> reps)
+        {
+            if (b.Vertices.Count < 4) return null;
+            if (!reps.TryGetValue(ClaveAfin(b), out var lista)) return null;
+            foreach (var r in lista)
+            {
+                var m = ResolverAfin(r, b);
+                if (m == null) continue;
+                var fv = r.Final.Vertices;
+                var clon = new MeshData
+                {
+                    Guid = b.Guid, ElementId = b.ElementId, MaterialId = b.MaterialId, CategoryId = b.CategoryId,
+                    ColR = b.ColR, ColG = b.ColG, ColB = b.ColB, ColA = b.ColA, HasColor = b.HasColor,
+                    HatchAngle = b.HatchAngle, HatchSpacing = b.HatchSpacing,
+                    FamilyName = b.FamilyName, TypeName = b.TypeName,
+                    RoomLevel = b.RoomLevel, RoomDepartment = b.RoomDepartment, RoomName = b.RoomName,
+                    Vertices = new List<Vector3>(fv.Count), Indices = new List<int>(r.Final.Indices)
+                };
+                clon.CopiarPropiedadesDe(b);
+                foreach (var p in fv) clon.Vertices.Add(AplicarAfin(m, p));
+                ComputeNormals(clon);
+                clon.DedupRef = r.Final;
+                clon.DedupM = m;
+                return clon;
+            }
+            return null;
+        }
+
+        // M (fila a fila, 9) + t (3) tales que b.v[i] = M·rep.v[i] + t para todo i; null si no.
+        static double[] ResolverAfin(RepAfin r, MeshData b)
+        {
+            var av = r.Welded.Vertices; var bv = b.Vertices;
+            if (av.Count != bv.Count) return null;
+            var I = r.B;
+            var a0 = av[I[0]]; var b0 = bv[I[0]];
+            double[] eb = new double[9];
+            for (int k = 1; k <= 3; k++)
+            {
+                var d = bv[I[k]] - b0;
+                eb[k - 1] = d.X; eb[3 + k - 1] = d.Y; eb[6 + k - 1] = d.Z;
+            }
+            var iv = r.InvEa;
+            var M = new double[12];
+            for (int row = 0; row < 3; row++)
+                for (int col = 0; col < 3; col++)
+                    M[3 * row + col] = eb[3 * row] * iv[col] + eb[3 * row + 1] * iv[3 + col] + eb[3 * row + 2] * iv[6 + col];
+            M[9] = b0.X - (M[0] * a0.X + M[1] * a0.Y + M[2] * a0.Z);
+            M[10] = b0.Y - (M[3] * a0.X + M[4] * a0.Y + M[5] * a0.Z);
+            M[11] = b0.Z - (M[6] * a0.X + M[7] * a0.Y + M[8] * a0.Z);
+            for (int i = 0; i < av.Count; i++)
+            {
+                var p = av[i]; var q = bv[i];
+                if (Math.Abs(M[0] * p.X + M[1] * p.Y + M[2] * p.Z + M[9] - q.X) > EpsAfin) return null;
+                if (Math.Abs(M[3] * p.X + M[4] * p.Y + M[5] * p.Z + M[10] - q.Y) > EpsAfin) return null;
+                if (Math.Abs(M[6] * p.X + M[7] * p.Y + M[8] * p.Z + M[11] - q.Z) > EpsAfin) return null;
+            }
+            return M;
+        }
+
+        static Vector3 AplicarAfin(double[] m, Vector3 p) => new Vector3(
+            (float)(m[0] * p.X + m[1] * p.Y + m[2] * p.Z + m[9]),
+            (float)(m[3] * p.X + m[4] * p.Y + m[5] * p.Z + m[10]),
+            (float)(m[6] * p.X + m[7] * p.Y + m[8] * p.Z + m[11]));
 
         // Presupuesto CONSERVADOR: preferimos triángulos de más antes que piezas rotas.
         // Muros/suelos/techos ni siquiera llegan acá (categorías protegidas); esto aplica
@@ -695,9 +1087,20 @@ namespace ConvertidorGeometrias
                 Guid = source.Guid,
                 ElementId = source.ElementId,
                 MaterialId = source.MaterialId,
+                // CategoryId se perdía acá: toda pieza decimada (puertas, ventanas, mobiliario —
+                // muros y losas ni llegan, están protegidos) salía al .tbv con categoría 0. En el
+                // visor eso rompe el filtro por categoría y la transparencia de puertas, que se
+                // deciden justamente por catId. Los muros no dependían de esto, pero el hatch se
+                // enciende por categoría, así que el bug tenía que irse antes de apoyarse ahí.
+                CategoryId = source.CategoryId,
                 ColR = source.ColR, ColG = source.ColG, ColB = source.ColB, ColA = source.ColA,
-                HasColor = source.HasColor
+                HasColor = source.HasColor,
+                HatchAngle = source.HatchAngle, HatchSpacing = source.HatchSpacing,
+                // Mismo riesgo que tuvo CategoryId acá: sin copiarlos, toda pieza decimada
+                // (puertas, ventanas, mobiliario) sale al .tbv con familia/tipo -1.
+                FamilyName = source.FamilyName, TypeName = source.TypeName
             };
+            outMesh.CopiarPropiedadesDe(source);
 
             foreach (var v in decimatedMdMesh.Vertices)
             {
@@ -879,6 +1282,11 @@ namespace ConvertidorGeometrias
         // v3: además agrega el id de BuiltInCategory (int32) después del MaterialId.
         // v4: cabecera con el Punto Base del Proyecto + metadata de habitaciones.
         // v5: las coordenadas vienen en METROS (v4 y anteriores venían en pies).
+        // v6: cada bloque agrega el patrón de superficie (2 floats: ángulo rad, separación m)
+        //     justo después del RGBA. Sólo los muros lo traen distinto de cero.
+        // v7: cada bloque agrega DOS strings length-prefixed (BinaryWriter.Write(string)) con el
+        //     nombre de Familia y de Tipo, justo DESPUÉS del categoryId y ANTES del RGBA.
+        //     "" cuando el elemento no tiene ElementType (habitaciones, in-situ).
         static List<MeshData> LeerBinario(string path, PipelineStats stats)
         {
             var meshes = new List<MeshData>();
@@ -886,7 +1294,7 @@ namespace ConvertidorGeometrias
             using (var fs = File.OpenRead(path))
             using (var reader = new BinaryReader(fs))
             {
-                bool v2 = false, v3 = false, v4 = false, v5 = false;
+                bool v2 = false, v3 = false, v4 = false, v5 = false, v6 = false, v7 = false, v8 = false;
                 if (fs.Length >= 8)
                 {
                     int magic = reader.ReadInt32();
@@ -897,6 +1305,9 @@ namespace ConvertidorGeometrias
                         v3 = version >= 3;
                         v4 = version >= 4;
                         v5 = version >= 5;
+                        v6 = version >= 6;
+                        v7 = version >= 7;
+                        v8 = version >= 8;
                         stats.FormatVersion = version;
                     }
                     else
@@ -920,6 +1331,9 @@ namespace ConvertidorGeometrias
                 }
                 stats.PuntoBase = new Vector3(baseX, baseY, baseZ);
 
+                // v8: nombre del archivo .rvt de origen, justo después del Punto Base.
+                if (v8) stats.ArchivoRvt = reader.ReadString() ?? "";
+
                 while (fs.Position < fs.Length)
                 {
                     var mesh = new MeshData();
@@ -932,6 +1346,23 @@ namespace ConvertidorGeometrias
                         mesh.CategoryId = reader.ReadInt32();
                     }
 
+                    // v7: familia y tipo van entre el categoryId y el RGBA, no al final del
+                    // bloque. Leerlos fuera de ese punto desalinea todo el stream.
+                    if (v7)
+                    {
+                        mesh.FamilyName = reader.ReadString() ?? "";
+                        mesh.TypeName = reader.ReadString() ?? "";
+                    }
+
+                    // v8: nivel + área/longitud/volumen (de parámetros de Revit), después del tipo.
+                    if (v8)
+                    {
+                        mesh.Level = reader.ReadString() ?? "";
+                        mesh.Area = reader.ReadSingle();
+                        mesh.Length = reader.ReadSingle();
+                        mesh.Volume = reader.ReadSingle();
+                    }
+
                     if (v2)
                     {
                         mesh.ColR = reader.ReadByte();
@@ -939,6 +1370,15 @@ namespace ConvertidorGeometrias
                         mesh.ColB = reader.ReadByte();
                         mesh.ColA = reader.ReadByte();
                         mesh.HasColor = true;
+                    }
+
+                    if (v6)
+                    {
+                        // El ángulo NO se toca al rotar Z-up -> Y-up (ver más abajo): el patrón
+                        // vive en el plano de la cara del muro, y esa rotación mantiene la
+                        // horizontal horizontal y la vertical vertical dentro de un muro.
+                        mesh.HatchAngle = reader.ReadSingle();
+                        mesh.HatchSpacing = reader.ReadSingle();
                     }
 
                     int vertexCount = reader.ReadInt32();
@@ -990,8 +1430,8 @@ namespace ConvertidorGeometrias
                     // Antes esto era el caso NORMAL (el soldado borraba el centroide) y salía
                     // como [0,0,0] silencioso. Ahora es una anomalía real y se reporta.
                     stats.RoomsSinCentro++;
-                    Console.WriteLine($"  AVISO: habitación ElementId {m.ElementId} " +
-                                      $"('{m.RoomName}') llegó sin centroide; se omite del JSON.");
+                    Log($"  AVISO: habitación ElementId {m.ElementId} " +
+                        $"('{m.RoomName}') llegó sin centroide; se omite del JSON.");
                     continue;
                 }
 
@@ -1265,7 +1705,7 @@ namespace ConvertidorGeometrias
         //   - Compacto: normales en int8 (snorm), índices uint16 cuando se puede.
         //
         // Layout (little-endian):
-        //   Header: int32 magic('TBTV'=0x56544254), int32 version(2),
+        //   Header: int32 magic('TBTV'=0x56544254), int32 version(4),
         //           float32 unitsPerMeter,
         //           int32 matCount, int32 meshCount, int32 instCount,
         //           float32 sceneMin[3], float32 sceneMax[3]
@@ -1277,19 +1717,51 @@ namespace ConvertidorGeometrias
         // 1.0 porque LeerBinario ya convirtió todo a metros al leer el
         // export.bin (ver aMetros más arriba); un lector v1 (sin este campo)
         // debe asumir pies, como venía siendo.
-        //   Materiales × matCount: int32 materialId, uint8 R,G,B,A
+        // v3 (2026-08): la tabla de materiales agrega el patrón de superficie vectorial
+        // (float32 hatchAngle en radianes, float32 hatchSpacing en metros). Es la definición
+        // del FillPattern de Revit, NO una textura: el visor reconstruye las líneas por
+        // fragmento en el shader, así que el patrón se ve nítido a cualquier zoom y suma
+        // 8 bytes por material (no por pieza) al archivo. spacing <= 0 = sin patrón.
+        // Sólo los muros traen patrón, y el visor además lo enciende sólo en esa categoría.
+        // v4 (2026-09): agrega la TABLA DE NOMBRES (familias y tipos de Revit) y dos índices por
+        // instancia. Los nombres se deduplican: un modelo con 40.000 instancias suele tener unos
+        // pocos cientos de nombres distintos, así que la tabla pesa kilobytes y no megabytes.
+        // La tabla va DESPUÉS de los materiales y ANTES del pool de mallas.
+        //   Materiales × matCount: int32 materialId, uint8 R,G,B,A,
+        //                          (v3+) float32 hatchAngle, float32 hatchSpacing
+        //   (v4+) Tabla de nombres: int32 nameCount,
+        //                           luego nameCount × (uint16 len, byte[len] nombre UTF8)
+        //         NO contiene la cadena vacía: "sin dato" se codifica como índice -1.
         //   Meshes (pool) × meshCount:
         //           int32 vertexCount, uint8 idx16(1/0), int32 triCount,
         //           float32 positions[vc*3], int8 normals[vc*3],
         //           (idx16? uint16 : uint32) indices[triCount*3]
+        // v5 (2026-10): propiedades por elemento leídas de PARÁMETROS de Revit. Tras la tabla de
+        // nombres va int32 fileIdx (nombre del .rvt de origen, -1 = sin dato) y cada instancia
+        // agrega, después de typeIdx: int32 levelIdx (nombre del nivel en la tabla de nombres),
+        // float32 area (m²), float32 length (m, largo/longitud/perímetro), float32 volume (m³).
+        // NaN = el elemento no expone ese parámetro.
+        // v7 (2026-11): la malla del pool se escribe con EscribirMallaV7: banderas bit1 = posiciones cuantizadas EMPAQUETADAS a bits por
+        // eje (paso 0,4 mm: float min[3], float size[3], byte bits[3], vc*(bx+by+bz) bits redondeados a byte), bit2 = índices en varint de
+        // marca de agua (int32 largo + bytes; 0 = vértice nuevo, c = reusa hw+1-c; vértices reordenados por primer uso), bit3 = normales
+        // octaédricas (2 x snorm8). Las instancias son como en v6.
+        // v6 (2026-11): (a) cada malla del pool lleva en el byte de banderas bit0 = índices uint16 y bit1 = posiciones
+        // CUANTIZADAS: float32 min[3], float32 size[3] y uint16 q[vc*3] (pos = min + q/65535*size) en lugar de float32 positions[vc*3];
+        // (b) cada instancia lleva, justo después de volume, un byte xf: 0 = float32 tx,ty,tz (como v5); 1 = float32 m[12]
+        // (M 3x3 por filas, luego t): vértice del mundo = M·pool + t, y la normal = normalize(M^-T · n). Así una malla se guarda una
+        // sola vez aunque sus copias estén giradas, espejadas o estiradas (codos, accesorios, tramos de tubería).
         //   Instancias × instCount:
         //           int32 meshIndex, int32 elementId, int32 categoryId, int32 materialIndex,
+        //           (v4+) int32 familyIdx, int32 typeIdx,   // índice en la tabla de nombres, -1 = sin dato
+        //           (v5+) int32 levelIdx, float32 area, float32 length, float32 volume,
         //           float32 tx,ty,tz, float32 gmin[3], float32 gmax[3],
         //           uint16 guidLen, byte[guidLen] guid(UTF8)
         static void ExportToViewerBin(List<MeshData> meshes, string path, PipelineStats stats)
         {
             const int MAGIC = 0x56544254; // "TBTV"
-            const int VERSION = 2;
+            const int VERSION = 7;
+            // Tope del prefijo de longitud (uint16) de cada nombre de la tabla.
+            const int NAME_MAX_BYTES = 65535;
             const float UNITS_PER_METER_OUT = 1.0f; // el pipeline siempre entrega metros de acá en más
 
             // Tabla de materiales: un color por MaterialId
@@ -1301,10 +1773,20 @@ namespace ConvertidorGeometrias
             {
                 if (m.Vertices == null || m.Vertices.Count == 0 || m.Indices.Count < 3) continue;
 
-                if (!matIndexById.ContainsKey(m.MaterialId))
+                int existente;
+                if (!matIndexById.TryGetValue(m.MaterialId, out existente))
                 {
                     matIndexById[m.MaterialId] = matReps.Count;
                     matReps.Add(m);
+                }
+                else if (m.HasHatch && !matReps[existente].HasHatch)
+                {
+                    // El mismo material de Revit puede estar en un muro Y en una losa, y sólo
+                    // el muro trae patrón. Como el primero que aparece gana el lugar de
+                    // representante, si ese primero era la losa el hatch se perdía entero.
+                    // Gana el que SÍ tiene patrón; que la losa no se raye lo garantiza el
+                    // visor, que enciende el hatch sólo en la categoría de muros.
+                    matReps[existente] = m;
                 }
             }
 
@@ -1320,10 +1802,30 @@ namespace ConvertidorGeometrias
             // bucles de abajo seguían recorriendo `meshes` entero: los índices se desfasaban y
             // reventaba con IndexOutOfRangeException en cuanto el modelo tenía una habitación.
             var instSource = new List<MeshData>(meshes.Count);
+            // v6: matriz afín (12 doubles: M 3x3 por filas + t) de las instancias que son una copia girada/estirada de una malla del pool;
+            // null = sólo traslación (instDelta). Vértice del mundo = M·pool + t.
+            var instXf = new List<double[]>(meshes.Count);
+            // pieza ya procesada -> (malla del pool, traslación): para componer con las copias afines que la usan de representante
+            var pieceAt = new Dictionary<MeshData, (int pool, Vector3 delta)>();
 
             foreach (var m in meshes)
             {
                 if (m.Vertices == null || m.Vertices.Count == 0 || m.Indices.Count < 3) continue;
+
+                if (m.DedupRef != null && m.DedupM != null && pieceAt.TryGetValue(m.DedupRef, out var rp) && AfinVigente(m))
+                {
+                    var M = (double[])m.DedupM.Clone();
+                    // B = M·(pool + dr) + t = M·pool + (M·dr + t)
+                    M[9] += M[0] * rp.delta.X + M[1] * rp.delta.Y + M[2] * rp.delta.Z;
+                    M[10] += M[3] * rp.delta.X + M[4] * rp.delta.Y + M[5] * rp.delta.Z;
+                    M[11] += M[6] * rp.delta.X + M[7] * rp.delta.Y + M[8] * rp.delta.Z;
+                    instMeshIdx.Add(rp.pool);
+                    instDelta.Add(Vector3.Zero);
+                    instXf.Add(M);
+                    instSource.Add(m);
+                    stats.AfinEnPool++;
+                    continue;
+                }
 
                 var key = (m.MaterialId, m.Vertices.Count, m.Indices.Count, GeometryHash(m));
                 if (!poolKey.TryGetValue(key, out var cand))
@@ -1351,19 +1853,74 @@ namespace ConvertidorGeometrias
 
                 instMeshIdx.Add(found);
                 instDelta.Add(delta);
+                instXf.Add(null);
                 instSource.Add(m);
+                pieceAt[m] = (found, delta);
             }
 
             stats.PoolMeshes = pool.Count;
+
+            // Caja global de cada instancia: la del pool movida, o (con matriz) la de sus propios vértices.
+            var instMin = new List<Vector3>(instSource.Count);
+            var instMax = new List<Vector3>(instSource.Count);
+            for (int i = 0; i < instSource.Count; i++)
+            {
+                if (instXf[i] != null)
+                {
+                    GetBounds(instSource[i].Vertices, out var bmn, out var bmx);
+                    instMin.Add(bmn); instMax.Add(bmx);
+                }
+                else
+                {
+                    var (pmn, pmx) = poolBounds[instMeshIdx[i]];
+                    instMin.Add(pmn + instDelta[i]); instMax.Add(pmx + instDelta[i]);
+                }
+            }
+
+            // v4: tabla de nombres deduplicada (familias y tipos juntos en la misma tabla).
+            // Sólo se indexan los nombres de las instancias que REALMENTE se escriben, y nunca
+            // la cadena vacía: "sin dato" viaja como -1, así el visor distingue "no vino el
+            // nombre" de "el nombre es una cadena vacía" sin gastar una entrada de tabla.
+            var nameIndex = new Dictionary<string, int>(StringComparer.Ordinal);
+            var nameBytes = new List<byte[]>();
+            Func<string, int> indiceNombre = s =>
+            {
+                if (string.IsNullOrEmpty(s)) return -1;
+                int idx;
+                if (nameIndex.TryGetValue(s, out idx)) return idx;
+                byte[] b = Encoding.UTF8.GetBytes(s);
+                // El prefijo de longitud es uint16: un nombre más largo no se puede representar.
+                // Descartarlo (-1) es preferible a escribir una longitud truncada, que
+                // desalinearía el archivo entero a partir de esa entrada.
+                if (b.Length > NAME_MAX_BYTES)
+                {
+                    Log($"  AVISO: nombre de familia/tipo de {b.Length} bytes (> {NAME_MAX_BYTES}); se omite.");
+                    nameIndex[s] = -1;
+                    return -1;
+                }
+                idx = nameBytes.Count;
+                nameBytes.Add(b);
+                nameIndex[s] = idx;
+                return idx;
+            };
+
+            var instFamIdx = new List<int>(instSource.Count);
+            var instTypIdx = new List<int>(instSource.Count);
+            var instLvlIdx = new List<int>(instSource.Count);
+            foreach (var m in instSource)
+            {
+                instFamIdx.Add(indiceNombre(m.FamilyName));
+                instTypIdx.Add(indiceNombre(m.TypeName));
+                instLvlIdx.Add(indiceNombre(m.Level));
+            }
+            int archivoIdx = indiceNombre(stats.ArchivoRvt);
 
             // AABB de toda la escena (para encuadre inicial del visor)
             Vector3 sMin = new Vector3(float.MaxValue), sMax = new Vector3(float.MinValue);
             for (int i = 0; i < instSource.Count; i++)
             {
-                var (mn, mx) = poolBounds[instMeshIdx[i]];
-                var d = instDelta[i];
-                sMin = Vector3.Min(sMin, mn + d);
-                sMax = Vector3.Max(sMax, mx + d);
+                sMin = Vector3.Min(sMin, instMin[i]);
+                sMax = Vector3.Max(sMax, instMax[i]);
             }
 
             // Sin ninguna instancia con geometría, el AABB queda invertido (MaxValue/MinValue)
@@ -1402,49 +1959,55 @@ namespace ConvertidorGeometrias
                         byte b = (byte)(rndColors.Next(0, 180) + 60);
                         w.Write(r); w.Write(g); w.Write(b); w.Write((byte)255);
                     }
+                    // v3: patrón de superficie vectorial (0,0 = sin patrón)
+                    w.Write(mr.HatchAngle);
+                    w.Write(mr.HatchSpacing);
+                    if (mr.HasHatch) stats.HatchedMats++;
                 }
+
+                // v4: tabla de nombres (va entre los materiales y el pool de mallas)
+                w.Write(nameBytes.Count);
+                foreach (var nb in nameBytes)
+                {
+                    w.Write((ushort)nb.Length);
+                    w.Write(nb);
+                }
+                w.Write(archivoIdx); // v5: nombre del .rvt de origen (índice en la tabla, -1 = sin dato)
 
                 // Meshes del pool
-                foreach (var pm in pool)
-                {
-                    int vc = pm.Vertices.Count;
-                    int tc = pm.Indices.Count / 3;
-                    bool idx16 = vc <= 65535;
-
-                    w.Write(vc);
-                    w.Write((byte)(idx16 ? 1 : 0));
-                    w.Write(tc);
-
-                    for (int i = 0; i < vc; i++)
-                    {
-                        var v = pm.Vertices[i];
-                        w.Write(v.X); w.Write(v.Y); w.Write(v.Z);
-                    }
-                    for (int i = 0; i < vc; i++)
-                    {
-                        var n = i < pm.Normals.Count ? pm.Normals[i] : Vector3.UnitY;
-                        w.Write(Snorm(n.X)); w.Write(Snorm(n.Y)); w.Write(Snorm(n.Z));
-                    }
-                    if (idx16)
-                        foreach (var ix in pm.Indices) w.Write((ushort)ix);
-                    else
-                        foreach (var ix in pm.Indices) w.Write((uint)ix);
-                }
+                int poolIx = 0;
+                foreach (var pm in pool) EscribirMallaV7(w, pm, poolBounds[poolIx++]);
 
                 // Instancias
                 for (int i = 0; i < instSource.Count; i++)
                 {
                     var m = instSource[i];
-                    var (mn, mx) = poolBounds[instMeshIdx[i]];
                     var d = instDelta[i];
-                    var gmin = mn + d;
-                    var gmax = mx + d;
+                    var gmin = instMin[i];
+                    var gmax = instMax[i];
 
                     w.Write(instMeshIdx[i]);
                     w.Write(m.ElementId);
                     w.Write(m.CategoryId);
                     w.Write(matIndexById[m.MaterialId]);
-                    w.Write(d.X); w.Write(d.Y); w.Write(d.Z);
+                    w.Write(instFamIdx[i]); // v4: índice en la tabla de nombres, -1 = sin dato
+                    w.Write(instTypIdx[i]); // v4: idem
+                    w.Write(instLvlIdx[i]); // v5: nivel (índice en la tabla de nombres)
+                    w.Write(m.Area);        // v5: m² (NaN = sin parámetro)
+                    w.Write(m.Length);      // v5: m
+                    w.Write(m.Volume);      // v5: m³
+                    // v6: 0 = sólo traslación (3 floats); 1 = matriz afín (M 3x3 por filas + t = 12 floats): mundo = M·pool + t
+                    var xf = instXf[i];
+                    if (xf == null)
+                    {
+                        w.Write((byte)0);
+                        w.Write(d.X); w.Write(d.Y); w.Write(d.Z);
+                    }
+                    else
+                    {
+                        w.Write((byte)1);
+                        for (int k = 0; k < 12; k++) w.Write((float)xf[k]);
+                    }
                     w.Write(gmin.X); w.Write(gmin.Y); w.Write(gmin.Z);
                     w.Write(gmax.X); w.Write(gmax.Y); w.Write(gmax.Z);
 
@@ -1452,9 +2015,206 @@ namespace ConvertidorGeometrias
                     w.Write((ushort)gb.Length);
                     w.Write(gb);
                 }
+
+                EscribirBloqueSprites(w, nameIndex);
             }
 
             stats.TbvBytes = new FileInfo(path).Length;
+        }
+
+        // Paso de cuantización objetivo de las posiciones (m): error <= 0,2 mm. Cada eje usa los bits que necesita (8..16) para ese paso.
+        const float PasoCuant = 0.0004f;
+
+        // v7: UNA malla del pool. Banderas: bit1 = posiciones cuantizadas y empaquetadas a bits por eje; bit2 = índices codificados como
+        // "marca de agua" en varint (con los vértices reordenados por primer uso); bit3 = normales octaédricas (2 bytes).
+        static void EscribirMallaV7(BinaryWriter w, MeshData pm, (Vector3 min, Vector3 max) bounds)
+        {
+            int n0 = pm.Vertices.Count;
+            // Vértices reordenados por primer uso en los índices (los que ningún triángulo usa se descartan).
+            var nuevo = new int[n0]; for (int i = 0; i < n0; i++) nuevo[i] = -1;
+            var orden = new List<int>(n0);
+            var idxNuevo = new int[pm.Indices.Count];
+            for (int k = 0; k < pm.Indices.Count; k++)
+            {
+                int x = pm.Indices[k];
+                if (nuevo[x] < 0) { nuevo[x] = orden.Count; orden.Add(x); }
+                idxNuevo[k] = nuevo[x];
+            }
+            int vc = orden.Count;
+            int tc = pm.Indices.Count / 3;
+
+            var min = bounds.min; var size = bounds.max - bounds.min;
+            bool cuant = Math.Max(size.X, Math.Max(size.Y, size.Z)) <= QuantMaxLado;
+            w.Write(vc);
+            w.Write((byte)((cuant ? 2 : 0) | 4 | 8));
+            w.Write(tc);
+
+            if (cuant)
+            {
+                int bx = BitsEje(size.X), by = BitsEje(size.Y), bz = BitsEje(size.Z);
+                w.Write(min.X); w.Write(min.Y); w.Write(min.Z);
+                w.Write(size.X); w.Write(size.Y); w.Write(size.Z);
+                w.Write((byte)bx); w.Write((byte)by); w.Write((byte)bz);
+                var bw = new BitWriter(w);
+                foreach (int src in orden)
+                {
+                    var v = pm.Vertices[src];
+                    bw.Put(CuantizarN(v.X, min.X, size.X, bx), bx);
+                    bw.Put(CuantizarN(v.Y, min.Y, size.Y, by), by);
+                    bw.Put(CuantizarN(v.Z, min.Z, size.Z, bz), bz);
+                }
+                bw.Flush();
+            }
+            else
+            {
+                foreach (int src in orden) { var v = pm.Vertices[src]; w.Write(v.X); w.Write(v.Y); w.Write(v.Z); }
+            }
+
+            foreach (int src in orden)
+            {
+                var n = src < pm.Normals.Count ? pm.Normals[src] : Vector3.UnitY;
+                OctEncode(n, out sbyte ox, out sbyte oy);
+                w.Write(ox); w.Write(oy);
+            }
+
+            // índices: 0 = vértice nuevo (hw+1); c >= 1 = reusa el vértice hw+1-c. Varint de 7 bits.
+            var ms = new MemoryStream(idxNuevo.Length + 16);
+            int hw = -1;
+            foreach (int x in idxNuevo)
+            {
+                uint c;
+                if (x > hw) { c = 0; hw = x; } else c = (uint)(hw + 1 - x);
+                while (c >= 128) { ms.WriteByte((byte)((c & 127) | 128)); c >>= 7; }
+                ms.WriteByte((byte)c);
+            }
+            w.Write((int)ms.Length);
+            w.Write(ms.GetBuffer(), 0, (int)ms.Length);
+        }
+
+        static int BitsEje(float size)
+        {
+            if (!(size > 0f)) return 0;
+            double niveles = Math.Ceiling(size / PasoCuant);
+            int b = (int)Math.Ceiling(Math.Log(Math.Max(2.0, niveles + 1), 2));
+            return Math.Max(1, Math.Min(16, b));
+        }
+
+        static uint CuantizarN(float v, float min, float size, int bits)
+        {
+            if (bits <= 0 || !(size > 0f)) return 0;
+            uint max = (1u << bits) - 1;
+            double q = Math.Round((v - min) / size * max);
+            return (uint)Math.Max(0.0, Math.Min(max, q));
+        }
+
+        // Octaédrica: normal unitaria -> 2 snorm8.
+        static void OctEncode(Vector3 n, out sbyte ox, out sbyte oy)
+        {
+            float l = Math.Abs(n.X) + Math.Abs(n.Y) + Math.Abs(n.Z);
+            if (!(l > 1e-12f)) { ox = 0; oy = 127; return; }
+            float px = n.X / l, py = n.Y / l;
+            if (n.Z < 0f)
+            {
+                float tx = (1f - Math.Abs(py)) * (px >= 0f ? 1f : -1f);
+                float ty = (1f - Math.Abs(px)) * (py >= 0f ? 1f : -1f);
+                px = tx; py = ty;
+            }
+            ox = (sbyte)Math.Max(-127, Math.Min(127, (int)Math.Round(px * 127f)));
+            oy = (sbyte)Math.Max(-127, Math.Min(127, (int)Math.Round(py * 127f)));
+        }
+
+        // Escritor de bits (MSB primero) sobre un BinaryWriter.
+        class BitWriter
+        {
+            readonly BinaryWriter _w; ulong _acc; int _n;
+            public BitWriter(BinaryWriter w) { _w = w; }
+            public void Put(uint v, int bits)
+            {
+                if (bits <= 0) return;
+                _acc = (_acc << bits) | (v & ((1u << bits) - 1)); _n += bits;
+                while (_n >= 8) { _n -= 8; _w.Write((byte)((_acc >> _n) & 0xFF)); }
+                _acc &= (1UL << _n) - 1;
+            }
+            public void Flush() { if (_n > 0) { _w.Write((byte)((_acc << (8 - _n)) & 0xFF)); _acc = 0; _n = 0; } }
+        }
+
+        // Lado mayor (m) hasta el que las posiciones del pool viajan cuantizadas a uint16 (error <= lado/65535 ~ 0,25 mm).
+        const float QuantMaxLado = 16f;
+
+        static ushort Cuantizar(float v, float min, float size)
+        {
+            if (!(size > 0f)) return 0;
+            double q = Math.Round((v - min) / size * 65535.0);
+            return (ushort)Math.Max(0.0, Math.Min(65535.0, q));
+        }
+
+        // ¿La pieza sigue siendo exactamente M·(malla final del representante)? (puede haber sido reemplazada o reparada en el medio)
+        static bool AfinVigente(MeshData m)
+        {
+            var rv = m.DedupRef.Vertices; var mv = m.Vertices;
+            if (rv.Count != mv.Count || m.DedupRef.Indices.Count != m.Indices.Count) return false;
+            for (int i = 0; i < rv.Count; i++)
+            {
+                var p = AplicarAfin(m.DedupM, rv[i]);
+                if (Math.Abs(p.X - mv[i].X) > 1e-3f || Math.Abs(p.Y - mv[i].Y) > 1e-3f || Math.Abs(p.Z - mv[i].Z) > 1e-3f) return false;
+            }
+            for (int i = 0; i < m.Indices.Count; i++) if (m.DedupRef.Indices[i] != m.Indices[i]) return false;
+            return true;
+        }
+
+        // Bloque OPCIONAL 'TXR1' al final del .tbv: una imagen (PNG con transparencia) por familia de Revit cuyo cuerpo exportado es
+        // un reemplazo gris (personas RPC, macetas VE_Planta). El visor dibuja el sprite en lugar de esa malla. No cambia la version
+        // del .tbv; un visor viejo ignora el bloque (el parser anterior lo rechazaria, por eso el visor se despliega primero).
+        // Fuente: carpeta "sprites" junto al exe, con archivos "<FamilyName>.<cartel|cruz>.png" (p.ej. "RPC Hombre.cartel.png",
+        // "VE_Planta.cruz.png"). Sin carpeta o sin archivos no se escribe nada. Formato: Visor3D/core/TbvSprites.js.
+        static void EscribirBloqueSprites(BinaryWriter w, Dictionary<string, int> nombres)
+        {
+            try
+            {
+                string dir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "sprites");
+                if (!Directory.Exists(dir)) return;
+                var defs = new List<(string clave, byte modo, byte[] png)>();
+                foreach (var f in Directory.GetFiles(dir, "*.png").OrderBy(x => x, StringComparer.OrdinalIgnoreCase))
+                {
+                    string n = Path.GetFileNameWithoutExtension(f);          // "RPC Hombre.cartel"
+                    int punto = n.LastIndexOf('.');
+                    if (punto <= 0) continue;
+                    // Sólo viaja la imagen de una familia que este .tbv realmente trae (no se agregan 300 KB a un modelo sin personas ni arbustos).
+                    int ixNombre;
+                    if (!nombres.TryGetValue(n.Substring(0, punto), out ixNombre) || ixNombre < 0) continue;
+                    string modoTxt = n.Substring(punto + 1).ToLowerInvariant();
+                    if (modoTxt != "cartel" && modoTxt != "cruz") continue;
+                    byte[] png = File.ReadAllBytes(f);
+                    if (png.Length == 0 || png.Length > 4 * 1024 * 1024) continue;
+                    defs.Add((n.Substring(0, punto), (byte)(modoTxt == "cruz" ? 1 : 0), png));
+                    if (defs.Count >= 64) break;
+                }
+                if (defs.Count == 0) return;
+                byte[] bloque;
+                using (var ms = new MemoryStream())
+                using (var bw = new BinaryWriter(ms))
+                {
+                    bw.Write(0x31525854); // 'TXR1'
+                    bw.Write(defs.Count);
+                    foreach (var d in defs)
+                    {
+                        var kb = Encoding.UTF8.GetBytes(d.clave);
+                        bw.Write((ushort)kb.Length);
+                        bw.Write(kb);
+                        bw.Write(d.modo);
+                        bw.Write(d.png.Length);
+                        bw.Write(d.png);
+                    }
+                    bw.Flush();
+                    bloque = ms.ToArray();
+                }
+                w.Write(bloque);   // de una vez: o entra entero o no entra
+            }
+            catch (Exception ex)
+            {
+                // Los sprites son un adorno: si fallan, el .tbv sigue siendo valido sin el bloque (no se escribio nada).
+                Console.WriteLine("[sprites] no se pudo escribir el bloque: " + ex.Message);
+            }
         }
 
         static sbyte Snorm(float f)
@@ -1463,4 +2223,240 @@ namespace ConvertidorGeometrias
             return (sbyte)Math.Round(f * 127f);
         }
     }
+
+    /// <summary>
+    /// Render de la consola, unificado con el resto de los post-procesadores del pipeline
+    /// (Parametros, Tablas, Posiciones, Geometrias, Planos): un encabezado fijo arriba con el
+    /// nombre y la descripcion del proceso, y de ahi para abajo UN RENGLON POR PROYECTO con
+    /// hora de inicio, hora de fin, barra de avance, porcentaje, etapa en curso y duracion.
+    ///
+    /// El renglon se dibuja en el lugar mientras avanza (con \r) y se cierra con un salto de
+    /// linea recien cuando el proyecto termina, asi la consola queda como un historial legible
+    /// en vez de una barra de progreso que se pisa a si misma.
+    ///
+    /// La barra usa '#' y '-' a proposito, no bloques Unicode: estos exes corren en la consola
+    /// que les toque y con la codepage por defecto los caracteres de bloque salen como '?'.
+    ///
+    /// TODO el dibujado va bajo un candado. No es precaucion teorica: en Planos el avance lo
+    /// reportan varios hilos a la vez (el lote de planos corre en Parallel.ForEach), y sin el
+    /// candado dos hilos escribiendo su \r y sus fragmentos se entrelazaban dejando renglones
+    /// ilegibles del tipo
+    ///   "SO_DU  08:09  [SO_DU  ##------[] ##------ 25%]  25%  generando..SO_DU  08:09..."
+    /// Los otros cuatro post-procesadores son monohilo y el candado no les cuesta nada.
+    /// </summary>
+            public static class Consola
+    {
+        private const string SIN_HORA = "--:--";
+
+        private static readonly object _candado = new object();
+        private static string _nombre = "";
+        private static string _etapa = "";
+        private static DateTime _inicio;
+        private static int _pct;
+        
+        private static DateTime? _ultimoFin = null;
+        private static int _esperandoIndex = 0;
+        private static char[] _spinner = new[] { '\\', '|', '/', '-' };
+        private static bool _enEsperando = false;
+        // T07: avance "[N/M] ..." del lote (ProgresoLotes); se agrega como DETALLE al final del renglon.
+        private static string _detalle = "";
+        private static int _ultLargoFila = 0;
+        public static void Detalle(string d) { lock (_candado) { _detalle = d ?? ""; } }
+
+        /// <summary>Hora en que arranco el proyecto en curso; la usa el log para su columna HoraInicio.</summary>
+        public static DateTime InicioActual { get { return _inicio; } }
+
+        public static void Encabezado(string titulo, string descripcion, string[][] rutas)
+        {
+            lock (_candado)
+            {
+                Console.WriteLine();
+                Console.ForegroundColor = ConsoleColor.Cyan;
+                Console.WriteLine(new string('=', 88));
+                Console.WriteLine("  MIP  -  " + titulo);
+                Console.ResetColor();
+                Console.ForegroundColor = ConsoleColor.Gray;
+                foreach (string linea in Envolver(descripcion, 84)) Console.WriteLine("  " + linea);
+                Console.ForegroundColor = ConsoleColor.Cyan;
+                Console.WriteLine(new string('-', 88));
+                Console.ResetColor();
+                foreach (string[] r in rutas)
+                {
+                    Console.ForegroundColor = ConsoleColor.DarkGray;
+                    Console.Write("  [" + r[2].PadRight(2) + "] " + r[0].PadRight(8) + " ");
+                    Console.ForegroundColor = ConsoleColor.Gray;
+                    Console.WriteLine(r[1]);
+                }
+                Console.ForegroundColor = ConsoleColor.Cyan;
+                Console.WriteLine(new string('=', 88));
+                Console.ForegroundColor = ConsoleColor.DarkGray;
+                Console.WriteLine("DELTA\tINICIO\tFIN\tPROYECTO\tAVANCE\tETAPA\tTIEMPO\tDETALLE");
+                Console.ResetColor();
+            }
+        }
+
+        public static void Esperando(int pendientes)
+        {
+            lock (_candado)
+            {
+                _enEsperando = true;
+                Console.ForegroundColor = ConsoleColor.DarkGray;
+                Console.Write("\rEsperando cambios " + _spinner[_esperandoIndex % _spinner.Length] + " " + (pendientes > 0 ? $"({pendientes} pendientes)" : "") + "    ");
+                Console.ResetColor();
+                _esperandoIndex++;
+            }
+        }
+        
+        private static void BorrarEsperando()
+        {
+            if (_enEsperando)
+            {
+                Console.Write("\r" + new string(' ', 50) + "\r");
+                _enEsperando = false;
+            }
+        }
+
+        public static void FilaInicio(string nombre, string etapa)
+        {
+            lock (_candado)
+            {
+                BorrarEsperando();
+                _nombre = nombre ?? "";
+                _etapa = etapa ?? "";
+                _inicio = DateTime.Now;
+                _pct = 0;
+                Pintar(false, TimeSpan.Zero, true, null);
+            }
+        }
+
+        public static void FilaProgreso(int pct)
+        {
+            lock (_candado)
+            {
+                BorrarEsperando();
+                _pct = pct < 0 ? 0 : (pct > 100 ? 100 : pct);
+                Pintar(false, TimeSpan.Zero, true, null);
+            }
+        }
+
+        public static void FilaProgreso(int pct, string etapa)
+        {
+            lock (_candado)
+            {
+                BorrarEsperando();
+                if (!string.IsNullOrEmpty(etapa)) _etapa = etapa;
+                _pct = pct < 0 ? 0 : (pct > 100 ? 100 : pct);
+                Pintar(false, TimeSpan.Zero, true, null);
+            }
+        }
+
+        public static void FilaFin(string nombre, TimeSpan t, bool ok, string resumen)
+        {
+            lock (_candado)
+            {
+                BorrarEsperando();
+                if (!string.IsNullOrEmpty(nombre)) _nombre = nombre;
+                if (ok) _pct = 100;
+                _etapa = ok ? "listo" : "ERROR";
+                DateTime fin = DateTime.Now;
+                Pintar(true, t, ok, fin, resumen);
+                Console.WriteLine();
+                _ultimoFin = fin;
+            }
+        }
+
+        private static void Pintar(bool terminado, TimeSpan t, bool ok, DateTime? fin)
+        {
+            Pintar(terminado, t, ok, fin, null);
+        }
+
+        private static void Pintar(bool terminado, TimeSpan t, bool ok, DateTime? fin, string cola)
+        {
+            string sIni = _inicio == default(DateTime) ? SIN_HORA : _inicio.ToString("HH:mm");
+            string sFin = fin.HasValue ? fin.Value.ToString("HH:mm") : SIN_HORA;
+            
+            string sDelta = "";
+            if (_ultimoFin.HasValue)
+            {
+                TimeSpan delta = _inicio - _ultimoFin.Value;
+                sDelta = $"{(int)delta.TotalMinutes:D2}:{delta.Seconds:D2}";
+            }
+            else
+            {
+                sDelta = "00:00";
+            }
+
+            int llenos = (int)Math.Round(_pct / 100.0 * 10);
+            if (llenos < 0) llenos = 0;
+            if (llenos > 10) llenos = 10;
+            
+            string barraAvance = "";
+            if (terminado && ok) {
+                barraAvance = $"Finalizado {sDelta}";
+                sDelta = ""; // Se limpia del principio segun ejemplo
+            } else {
+                barraAvance = $"[{new string('#', llenos)}{new string('-', 10 - llenos)}] {_pct}%";
+            }
+
+            // Limpiamos linea
+            Console.Write("\r" + new string(' ', AnchoUtilFila()) + "\r");
+            
+            if (ok) Console.ForegroundColor = ConsoleColor.Gray;
+            else Console.ForegroundColor = ConsoleColor.Red;
+            
+            string dur = terminado ? Duracion(t) : "-";
+            
+            string res = $"{sDelta}\t{sIni}\t{sFin}\t{_nombre}\t{barraAvance}\t{_etapa}\t{dur}";
+            if (!string.IsNullOrEmpty(cola)) res += "\t" + cola;
+            if (!string.IsNullOrEmpty(_detalle)) res += (string.IsNullOrEmpty(cola) ? "\t" : "  ") + _detalle;
+            _ultLargoFila = res.Length + 40;
+            
+            Console.Write(AjustarFila(res));
+            Console.ResetColor();
+        }
+
+        // La fila se repinta con '\r'. Si es mas ancha que la ventana se parte en dos renglones y cada
+        // repintado queda apilado debajo del anterior: se expanden los tabuladores (paradas de 8) y se
+        // recorta a ancho-1 para que ocupe SIEMPRE un solo renglon.
+        private static int AnchoUtilFila()
+        {
+            try { int w = Console.WindowWidth; return w > 20 ? w - 1 : 119; }
+            catch { return 119; }
+        }
+
+        private static string AjustarFila(string fila)
+        {
+            int max = AnchoUtilFila();
+            var sb = new System.Text.StringBuilder(max);
+            foreach (char c in fila ?? "")
+            {
+                if (sb.Length >= max) break;
+                if (c == '\t') { int n = 8 - (sb.Length % 8); sb.Append(' ', Math.Min(n, max - sb.Length)); }
+                else if (c == '\r' || c == '\n') sb.Append(' ');
+                else sb.Append(c);
+            }
+            return sb.ToString();
+        }
+        public static string Duracion(TimeSpan t)
+        {
+            if (t.TotalSeconds < 60) return t.TotalSeconds.ToString("F1") + "s";
+            return (int)t.TotalMinutes + "m " + t.Seconds + "s";
+        }
+
+        private static string[] Envolver(string texto, int ancho)
+        {
+            var lineas = new System.Collections.Generic.List<string>();
+            string actual = "";
+            foreach (string palabra in (texto ?? "").Split(' '))
+            {
+                if (actual.Length == 0) actual = palabra;
+                else if (actual.Length + 1 + palabra.Length <= ancho) actual += " " + palabra;
+                else { lineas.Add(actual); actual = palabra; }
+            }
+            if (actual.Length > 0) lineas.Add(actual);
+            return lineas.ToArray();
+        }
+    }
+
+
 }
